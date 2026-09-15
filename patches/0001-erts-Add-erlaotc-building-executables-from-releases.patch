@@ -1,0 +1,3296 @@
+From e8a2dd9f0b345ea90c4760b255b6cac9072a5ee4 Mon Sep 17 00:00:00 2001
+From: Wojtek Mach <wojtek@wojtekmach.pl>
+Date: Mon, 14 Sep 2026 22:35:15 +0200
+Subject: [PATCH 1/3] erts: Add erlaotc, building executables from releases
+
+erlaotc packages a release directory (lib/ and releases/) into one
+executable: the emulator followed by a zip archive of the release, with
+the erl arguments in the archive comment. Nothing is extracted at run
+time; the code is loaded from the executable as a primary archive
+(-primary_archive), read in the calling process. erl_child_setup,
+inet_gethost and epmd are linked into the emulator.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVJPWKb8jPWu1ctZmLCcAH
+---
+ Makefile.in                              |   2 +-
+ erts/Makefile                            |   6 +-
+ erts/emulator/Makefile.in                |  25 +
+ erts/emulator/beam/erl_aot.c             | 289 ++++++++++++
+ erts/emulator/beam/erl_aot.h             |  33 ++
+ erts/emulator/beam/erl_init.c            |   6 +-
+ erts/emulator/sys/unix/erl_helpers.h     |  32 ++
+ erts/emulator/sys/unix/erl_main.c        |  12 +
+ erts/emulator/sys/unix/sys_drivers.c     |  35 +-
+ erts/etc/common/Makefile.in              |  11 +-
+ erts/etc/common/erlaotc.c                | 573 +++++++++++++++++++++++
+ erts/etc/unix/Install.src                |   8 +
+ erts/etc/unix/erlaotc.src                |  54 +++
+ erts/preloaded/ebin/erl_prim_loader.beam | Bin 24088 -> 26136 bytes
+ erts/preloaded/ebin/init.beam            | Bin 28076 -> 28456 bytes
+ erts/preloaded/ebin/prim_zip.beam        | Bin 9652 -> 9932 bytes
+ erts/preloaded/src/erl_prim_loader.erl   | 402 ++++++++++------
+ erts/preloaded/src/init.erl              |  23 +
+ erts/preloaded/src/prim_zip.erl          |  39 +-
+ 19 files changed, 1400 insertions(+), 150 deletions(-)
+ create mode 100644 erts/emulator/beam/erl_aot.c
+ create mode 100644 erts/emulator/beam/erl_aot.h
+ create mode 100644 erts/emulator/sys/unix/erl_helpers.h
+ create mode 100644 erts/etc/common/erlaotc.c
+ create mode 100644 erts/etc/unix/erlaotc.src
+
+diff --git a/Makefile.in b/Makefile.in
+index e0981b1d9a..4a15dabc9b 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -127,7 +127,7 @@ BINDIR      = $(DESTDIR)$(EXTRA_PREFIX)$(bindir)
+ #
+ # Erlang base public files
+ #
+-ERL_BASE_PUB_FILES=erl erlc epmd run_erl to_erl dialyzer typer escript ct_run
++ERL_BASE_PUB_FILES=erl erlc epmd run_erl to_erl dialyzer typer escript ct_run erlaotc
+ 
+ # ERLANG_INST_LIBDIR is the top directory where the Erlang installation
+ # will be located when running.
+diff --git a/erts/Makefile b/erts/Makefile
+index 47737cda43..5658d6b195 100644
+--- a/erts/Makefile
++++ b/erts/Makefile
+@@ -80,6 +80,7 @@ local_setup:
+ 		$(ERL_TOP)/bin/dialyzer $(ERL_TOP)/bin/dialyzer.exe \
+ 		$(ERL_TOP)/bin/typer $(ERL_TOP)/bin/typer.exe \
+ 		$(ERL_TOP)/bin/ct_run $(ERL_TOP)/bin/ct_run.exe \
++		$(ERL_TOP)/bin/erlaotc \
+ 		$(ERL_TOP)/bin/start*.boot $(ERL_TOP)/bin/start*.script
+ 	@if [ "X$(TARGET)" = "Xwin32" ]; then \
+ 		cp $(ERL_TOP)/bin/$(TARGET)/dialyzer.exe $(ERL_TOP)/bin/dialyzer.exe; \
+@@ -105,6 +106,9 @@ local_setup:
+ 		-e "s;%VSN%;$(VSN);"    \
+ 		-e "s;%DYN_ERL_PATH%;$(TARGET)/dyn_erl;" \
+ 	        $(ERL_TOP)/erts/etc/unix/cerl.src > $(ERL_TOP)/bin/cerl; \
++	sed	-e "s;%FINAL_ROOTDIR%;$(ERL_TOP);"   \
++		-e "s;erts-.*/bin;bin/$(TARGET);"    \
++	        $(ERL_TOP)/erts/etc/unix/erlaotc.src > $(ERL_TOP)/bin/erlaotc; \
+ 		cp $(ERL_TOP)/bin/$(TARGET)/erl_call $(ERL_TOP)/bin/erl_call; \
+ 		cp $(ERL_TOP)/bin/$(TARGET)/dialyzer $(ERL_TOP)/bin/dialyzer; \
+ 		cp $(ERL_TOP)/bin/$(TARGET)/typer $(ERL_TOP)/bin/typer; \
+@@ -112,7 +116,7 @@ local_setup:
+ 		cp $(ERL_TOP)/bin/$(TARGET)/erlc $(ERL_TOP)/bin/erlc; \
+ 		cp $(ERL_TOP)/bin/$(TARGET)/escript $(ERL_TOP)/bin/escript; \
+ 	 	chmod 755 $(ERL_TOP)/bin/erl $(ERL_TOP)/bin/erlc \
+-			$(ERL_TOP)/bin/cerl; \
++			$(ERL_TOP)/bin/cerl $(ERL_TOP)/bin/erlaotc; \
+ 	fi
+ 	@cd start_scripts && $(MAKE) $(ERL_TOP)/bin/start.script \
+ 		$(ERL_TOP)/bin/start_sasl.script \
+diff --git a/erts/emulator/Makefile.in b/erts/emulator/Makefile.in
+index 028e2bcafc..87c7271403 100644
+--- a/erts/emulator/Makefile.in
++++ b/erts/emulator/Makefile.in
+@@ -1069,6 +1069,25 @@ update_asmjit:
+ #
+ CS_OBJ = $(OBJDIR)/erl_child_setup.o $(OBJDIR)/sys_uds.o $(OBJDIR)/hash.o
+ 
++EMBED_FLAGS = -include sys/unix/erl_helpers.h
++$(OBJDIR)/erl_child_setup_embedded.o: sys/unix/erl_child_setup.c
++	$(V_CC) $(CFLAGS) $(INCLUDES) $(EMBED_FLAGS) -Dmain=erl_child_setup_main \
++	  -Dsys_sigblock=erl_child_setup_sigblock \
++	  -Dsys_sigrelease=erl_child_setup_sigrelease -c $< -o $@
++
++$(OBJDIR)/inet_gethost_embedded.o: ../etc/common/inet_gethost.c
++	$(V_CC) $(CFLAGS) $(INCLUDES) $(EMBED_FLAGS) -Dmain=inet_gethost_main -c $< -o $@
++
++include ../epmd/epmd.mk
++EPMD_EMBED_FLAGS = $(EMBED_FLAGS) -I../epmd/src -DEPMD_PORT_NO=$(EPMD_PORT_NO) \
++  -Dmain=epmd_main
++$(OBJDIR)/epmd_embedded.o: ../epmd/src/epmd.c
++	$(V_CC) $(CFLAGS) $(INCLUDES) $(EPMD_EMBED_FLAGS) -c $< -o $@
++$(OBJDIR)/epmd_cli_embedded.o: ../epmd/src/epmd_cli.c
++	$(V_CC) $(CFLAGS) $(INCLUDES) $(EPMD_EMBED_FLAGS) -c $< -o $@
++$(OBJDIR)/epmd_srv_embedded.o: ../epmd/src/epmd_srv.c
++	$(V_CC) $(CFLAGS) $(INCLUDES) $(EPMD_EMBED_FLAGS) -c $< -o $@
++
+ $(BINDIR)/$(CS_EXECUTABLE): $(TTF_DIR)/GENERATED $(PRELOAD_SRC) $(CS_OBJ) $(ERTS_LIB)
+ 	$(ld_verbose) $(LD) $(CS_LDFLAGS) -o $(BINDIR)/$(CS_EXECUTABLE) \
+                $(CS_CFLAGS) $(COMMON_INCLUDES) $(CS_OBJ) $(CS_LIBS)
+@@ -1212,6 +1231,7 @@ RUN_OBJS += \
+ 	$(OBJDIR)/erl_bif_re.o		$(OBJDIR)/erl_unicode.o \
+ 	$(OBJDIR)/packet_parser.o	$(OBJDIR)/safe_hash.o \
+ 	$(OBJDIR)/erl_zlib.o		$(OBJDIR)/erl_nif.o \
++	$(OBJDIR)/erl_aot.o \
+ 	$(OBJDIR)/erl_bif_binary.o      $(OBJDIR)/erl_ao_firstfit_alloc.o \
+ 	$(OBJDIR)/erl_thr_queue.o	$(OBJDIR)/erl_sched_spec_pre_alloc.o \
+ 	$(OBJDIR)/erl_ptab.o		$(OBJDIR)/erl_map.o \
+@@ -1264,6 +1284,11 @@ OS_OBJS = \
+ 	$(OBJDIR)/sys_drivers.o \
+ 	$(OBJDIR)/sys_env.o \
+ 	$(OBJDIR)/sys_uds.o \
++	$(OBJDIR)/erl_child_setup_embedded.o \
++	$(OBJDIR)/inet_gethost_embedded.o \
++	$(OBJDIR)/epmd_embedded.o \
++	$(OBJDIR)/epmd_cli_embedded.o \
++	$(OBJDIR)/epmd_srv_embedded.o \
+ 	$(OBJDIR)/driver_tab.o \
+ 	$(OBJDIR)/unix_prim_file.o \
+ 	$(OBJDIR)/sys_float.o \
+diff --git a/erts/emulator/beam/erl_aot.c b/erts/emulator/beam/erl_aot.c
+new file mode 100644
+index 0000000000..ac7fb592c9
+--- /dev/null
++++ b/erts/emulator/beam/erl_aot.c
+@@ -0,0 +1,289 @@
++/*
++ * %CopyrightBegin%
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright Ericsson AB 2026. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * %CopyrightEnd%
++ */
++
++/* Executables built by erlaotc: the emulator followed by a zip archive whose
++ * comment holds the arguments ("erlaotc <vsn>\n" then one per line, $ROOT
++ * being the executable). */
++
++#ifdef HAVE_CONFIG_H
++#  include "config.h"
++#endif
++
++#include "sys.h"
++#include "erl_aot.h"
++#include "erl_version.h"
++
++#ifndef __WIN32__
++
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <errno.h>
++#include <limits.h>
++#ifdef __APPLE__
++#  include <mach-o/dyld.h>
++#endif
++
++#define MAGIC "erlaotc " ERLANG_VERSION "\n"
++#define ROOT_VAR "$ROOT"
++
++#define EOCD_SIZE 22
++#define EOCD_SIGNATURE 0x06054b50
++#define MAX_COMMENT_SIZE 65535
++
++static char exe_path[PATH_MAX];
++static int have_exe = 0;
++
++const char *erts_aot_exe_path(void)
++{
++    return have_exe ? exe_path : NULL;
++}
++
++const char *erts_aot_helper_marker(const char *program)
++{
++    static const char *helpers[][2] = {
++        {"inet_gethost", "-erlaot:inet_gethost"},
++        {"epmd", "-erlaot:epmd"},
++        {NULL, NULL}
++    };
++    size_t len = strlen(exe_path);
++    int i;
++
++    if (!have_exe || strncmp(program, exe_path, len) != 0 ||
++        strncmp(program + len, "/bin/", 5) != 0) {
++        return NULL;
++    }
++    program += len + 5;
++    for (i = 0; helpers[i][0] != NULL; i++) {
++        if (strcmp(program, helpers[i][0]) == 0)
++            return helpers[i][1];
++    }
++    return NULL;
++}
++
++static void fatal(const char *what, const char *arg)
++{
++    fprintf(stderr, "%s: %s: %s\n", exe_path, what, arg);
++    exit(1);
++}
++
++static void *xmalloc(size_t size)
++{
++    void *p = malloc(size);
++    if (p == NULL)
++        fatal("cannot allocate memory", "");
++    return p;
++}
++
++static int resolve_self_path(const char *argv0)
++{
++#if defined(__APPLE__)
++    char tmp[PATH_MAX];
++    uint32_t size = sizeof(tmp);
++    (void)argv0;
++    return _NSGetExecutablePath(tmp, &size) == 0 &&
++           realpath(tmp, exe_path) != NULL;
++#elif defined(__linux__)
++    ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
++    (void)argv0;
++    if (n <= 0)
++        return 0;
++    exe_path[n] = '\0';
++    return 1;
++#else
++    return argv0 != NULL && strchr(argv0, '/') != NULL &&
++           realpath(argv0, exe_path) != NULL;
++#endif
++}
++
++static Uint32 get_le32(const unsigned char *p)
++{
++    return (Uint32)p[0] | ((Uint32)p[1] << 8) | ((Uint32)p[2] << 16) |
++           ((Uint32)p[3] << 24);
++}
++
++static char *read_comment(int fd, off_t file_size)
++{
++    unsigned char *tail;
++    size_t tail_size, i;
++    char *comment = NULL;
++
++    tail_size = MAX_COMMENT_SIZE + EOCD_SIZE;
++    if ((off_t)tail_size > file_size)
++        tail_size = (size_t)file_size;
++    if (tail_size < EOCD_SIZE)
++        return NULL;
++    tail = xmalloc(tail_size);
++    if (pread(fd, tail, tail_size, file_size - (off_t)tail_size) !=
++        (ssize_t)tail_size) {
++        free(tail);
++        return NULL;
++    }
++
++    for (i = tail_size - EOCD_SIZE + 1; i-- > 0; ) {
++        if (get_le32(tail + i) == EOCD_SIGNATURE &&
++            tail[i + 20] + (tail[i + 21] << 8) ==
++            (int)(tail_size - i - EOCD_SIZE)) {
++            size_t len = tail_size - i - EOCD_SIZE;
++            comment = xmalloc(len + 1);
++            memcpy(comment, tail + i + EOCD_SIZE, len);
++            comment[len] = '\0';
++            break;
++        }
++    }
++    free(tail);
++    return comment;
++}
++
++static char *expand_arg(const char *arg)
++{
++    if (strncmp(arg, ROOT_VAR, strlen(ROOT_VAR)) == 0) {
++        const char *rest = arg + strlen(ROOT_VAR);
++        char *res = xmalloc(strlen(exe_path) + strlen(rest) + 1);
++        strcpy(res, exe_path);
++        strcat(res, rest);
++        return res;
++    }
++    return (char *)arg;
++}
++
++/* As erl(1) does */
++static void maybe_start_epmd(int argc, char **argv)
++{
++    int distributed = 0, start_epmd = 1, i;
++    pid_t pid;
++    int status;
++
++    for (i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "-sname") == 0 || strcmp(argv[i], "-name") == 0)
++            distributed = 1;
++        else if (strcmp(argv[i], "-start_epmd") == 0 && i + 1 < argc)
++            start_epmd = strcmp(argv[i + 1], "false") != 0;
++        else if (strcmp(argv[i], "-extra") == 0)
++            break;
++    }
++    if (!distributed || !start_epmd)
++        return;
++
++    pid = fork();
++    if (pid < 0)
++        fatal("cannot start epmd", strerror(errno));
++    if (pid == 0) {
++        execl(exe_path, exe_path, "-erlaot:epmd", "-daemon", (char *)NULL);
++        _exit(127);
++    }
++    while (waitpid(pid, &status, 0) < 0) {
++        if (errno != EINTR)
++            fatal("cannot start epmd", strerror(errno));
++    }
++    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
++        fatal("cannot start epmd", "epmd failed");
++}
++
++void erts_aot_early_args(int *argc, char ***argv)
++{
++    struct stat st;
++    int fd, n, i;
++    char *comment, *line, *next;
++    char **args;
++    const char *env;
++
++    if (*argc < 1 || !resolve_self_path((*argv)[0]))
++        return;
++    fd = open(exe_path, O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return;
++    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
++        close(fd);
++        return;
++    }
++    comment = read_comment(fd, st.st_size);
++    close(fd);
++    if (comment == NULL)
++        return;
++    if (strncmp(comment, "erlaotc ", 8) != 0) {
++        free(comment);
++        return;
++    }
++    if (strncmp(comment, MAGIC, strlen(MAGIC)) != 0)
++        fatal("the archive was built for another version of erts", comment);
++    have_exe = 1;
++
++    n = 0;
++    for (line = comment; *line != '\0'; line++) {
++        if (*line == '\n')
++            n++;
++    }
++    args = xmalloc(sizeof(char *) * (n + *argc + 8));
++    i = 0;
++    args[i++] = (*argv)[0];
++    for (line = comment + strlen(MAGIC); *line != '\0'; line = next) {
++        next = strchr(line, '\n');
++        if (next == NULL)
++            fatal("corrupt archive comment", line);
++        *next++ = '\0';
++        args[i++] = expand_arg(line);
++    }
++
++    /* As erl(1) */
++    env = getenv("HOME");
++    if (env != NULL && env[0] != '\0') {
++        args[i++] = "-home";
++        args[i++] = (char *)env;
++    }
++    env = getenv("ERL_EPMD_PORT");
++    if (env != NULL && env[0] != '\0') {
++        args[i++] = "-epmd_port";
++        args[i++] = (char *)env;
++    }
++
++    args[i++] = "-extra";
++    memcpy(args + i, *argv + 1, sizeof(char *) * (*argc - 1));
++    i += *argc - 1;
++    args[i] = NULL;
++
++    *argc = i;
++    *argv = args;
++    maybe_start_epmd(*argc, *argv);
++}
++
++#else /* __WIN32__ */
++
++void erts_aot_early_args(int *argc, char ***argv)
++{
++    (void)argc;
++    (void)argv;
++}
++
++const char *erts_aot_exe_path(void)
++{
++    return NULL;
++}
++
++const char *erts_aot_helper_marker(const char *program)
++{
++    (void)program;
++    return NULL;
++}
++
++#endif
+diff --git a/erts/emulator/beam/erl_aot.h b/erts/emulator/beam/erl_aot.h
+new file mode 100644
+index 0000000000..5ea99de1f3
+--- /dev/null
++++ b/erts/emulator/beam/erl_aot.h
+@@ -0,0 +1,33 @@
++/*
++ * %CopyrightBegin%
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright Ericsson AB 2026. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * %CopyrightEnd%
++ */
++
++#ifndef __ERL_AOT_H__
++#define __ERL_AOT_H__
++
++void erts_aot_early_args(int *argc, char ***argv);
++
++const char *erts_aot_exe_path(void);
++
++/* <exe>/bin/<helper> is run as <exe> <marker> */
++const char *erts_aot_helper_marker(const char *program);
++
++#endif
+diff --git a/erts/emulator/beam/erl_init.c b/erts/emulator/beam/erl_init.c
+index 3d24646885..61c9f037c5 100644
+--- a/erts/emulator/beam/erl_init.c
++++ b/erts/emulator/beam/erl_init.c
+@@ -58,6 +58,7 @@
+ #include "erl_iolist.h"
+ #include "erl_debugger.h"
+ #include "erl_record.h"
++#include "erl_aot.h"
+ #include "erl_crash_dump.h"
+ 
+ #include "jit/beam_asm.h"
+@@ -1299,7 +1300,7 @@ erl_start(int argc, char **argv)
+     int have_break_handler = 1;
+     char envbuf[21]; /* enough for any 64-bit integer */
+     size_t envbufsz;
+-    int ncpu = early_init(&argc, argv);
++    int ncpu;
+     int proc_tab_sz = ERTS_DEFAULT_MAX_PROCESSES;
+     int port_tab_sz = ERTS_DEFAULT_MAX_PORTS;
+     int port_tab_sz_ignore_files = 0;
+@@ -1311,6 +1312,9 @@ erl_start(int argc, char **argv)
+     int node_tab_delete_delay = ERTS_NODE_TAB_DELAY_GC_DEFAULT;
+     ErtsDbSpinCount db_spin_count = ERTS_DB_SPNCNT_NORMAL;
+ 
++    erts_aot_early_args(&argc, &argv);
++    ncpu = early_init(&argc, argv);
++
+     /* Must be set up as early as possible for crash dump encryption to work
+      * properly. */
+     erl_crash_dump_init();
+diff --git a/erts/emulator/sys/unix/erl_helpers.h b/erts/emulator/sys/unix/erl_helpers.h
+new file mode 100644
+index 0000000000..bf14e216e4
+--- /dev/null
++++ b/erts/emulator/sys/unix/erl_helpers.h
+@@ -0,0 +1,32 @@
++/*
++ * %CopyrightBegin%
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright Ericsson AB 2026. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * %CopyrightEnd%
++ */
++
++/* The helper programs linked into the emulator (see erl_main.c) */
++
++#ifndef __ERL_HELPERS_H__
++#define __ERL_HELPERS_H__
++
++int erl_child_setup_main(int argc, char **argv);
++int inet_gethost_main(int argc, char **argv);
++int epmd_main(int argc, char **argv);
++
++#endif
+diff --git a/erts/emulator/sys/unix/erl_main.c b/erts/emulator/sys/unix/erl_main.c
+index 2d1d60e3d1..7f8d4ded83 100644
+--- a/erts/emulator/sys/unix/erl_main.c
++++ b/erts/emulator/sys/unix/erl_main.c
+@@ -25,10 +25,22 @@
+ #include "sys.h"
+ #include "erl_vm.h"
+ #include "global.h"
++#include <string.h>
++#include "erl_helpers.h"
+ 
+ int
+ main(int argc, char **argv)
+ {
++    if (argc >= 2 && strcmp(argv[1], "-erlaot:child_setup") == 0) {
++        return erl_child_setup_main(argc - 1, argv + 1);
++    }
++    if (argc >= 2 && strcmp(argv[1], "-erlaot:inet_gethost") == 0) {
++        return inet_gethost_main(argc - 1, argv + 1);
++    }
++    if (argc >= 2 && strcmp(argv[1], "-erlaot:epmd") == 0) {
++        return epmd_main(argc - 1, argv + 1);
++    }
++
+     /* Must be done before we have a chance to spawn any scheduler threads. */
+     sys_init_signal_stack();
+ 
+diff --git a/erts/emulator/sys/unix/sys_drivers.c b/erts/emulator/sys/unix/sys_drivers.c
+index bdd6528412..5850fda985 100644
+--- a/erts/emulator/sys/unix/sys_drivers.c
++++ b/erts/emulator/sys/unix/sys_drivers.c
+@@ -78,6 +78,7 @@ static Eterm forker_port;
+ #include "sys_uds.h"
+ 
+ #include "erl_child_setup.h"
++#include "erl_aot.h"
+ 
+ #if defined IOV_MAX
+ #define MAXIOV IOV_MAX
+@@ -471,6 +472,7 @@ static void *add_spawn_env_block(const erts_osenv_t *env, struct iovec *iov,
+ static ErlDrvData spawn_start(ErlDrvPort port_num, char* name,
+                               SysDriverOpts* opts)
+ {
++    const char *aot_marker = NULL;
+ #define CMD_LINE_PREFIX_STR "exec "
+ #define CMD_LINE_PREFIX_STR_SZ (sizeof(CMD_LINE_PREFIX_STR) - 1)
+ 
+@@ -508,6 +510,10 @@ static ErlDrvData spawn_start(ErlDrvPort port_num, char* name,
+ 
+     if (opts->spawn_type == ERTS_SPAWN_EXECUTABLE) {
+ 	/* started with spawn_executable, not with spawn */
++        aot_marker = erts_aot_helper_marker(name);
++        if (aot_marker != NULL) {
++            name = (char *) erts_aot_exe_path();
++        }
+ 	len = strlen(name);
+ 	cmd_line = (char *) erts_alloc_fnf(ERTS_ALC_T_TMP, len + 1);
+ 	if (!cmd_line) {
+@@ -581,6 +587,8 @@ static ErlDrvData spawn_start(ErlDrvPort port_num, char* name,
+             } else {
+                 argv_len++;
+             }
++            if (aot_marker != NULL)
++                argv_len++;
+             iov_len += 1 + argv_len; /* num argvs including size int */
+         }
+ 
+@@ -649,11 +657,21 @@ static ErlDrvData spawn_start(ErlDrvPort port_num, char* name,
+                         io_vector[i].iov_base = opts->argv[j];
+                     io_vector[i].iov_len = strlen(io_vector[i].iov_base) + 1;
+                     buffsz += io_vector[i++].iov_len;
++                    if (j == 0 && aot_marker != NULL) {
++                        io_vector[i].iov_base = (void *) aot_marker;
++                        io_vector[i].iov_len = strlen(aot_marker) + 1;
++                        buffsz += io_vector[i++].iov_len;
++                    }
+                 }
+             } else {
+                 io_vector[i].iov_base = cmd_line;
+                 io_vector[i].iov_len = strlen(io_vector[i].iov_base) + 1;
+                 buffsz += io_vector[i++].iov_len;
++                if (aot_marker != NULL) {
++                    io_vector[i].iov_base = (void *) aot_marker;
++                    io_vector[i].iov_len = strlen(aot_marker) + 1;
++                    buffsz += io_vector[i++].iov_len;
++                }
+             }
+         }
+ 
+@@ -1600,6 +1618,13 @@ static ErlDrvData forker_start(ErlDrvPort port_num, char* name,
+ 
+     forker_port = erts_drvport2id(port_num);
+ 
++    if (erts_aot_exe_path() != NULL) {
++        child_setup_prog = erts_alloc(ERTS_ALC_T_CS_PROG_PATH,
++                                      strlen(erts_aot_exe_path()) + 1);
++        strcpy(child_setup_prog, erts_aot_exe_path());
++        goto have_child_setup;
++    }
++
+     res = erts_sys_explicit_8bit_getenv("BINDIR", bindir, &bindirsz);
+     if (res == 0) {
+         erts_exit(1, "Environment variable BINDIR is not set\n");
+@@ -1621,6 +1646,7 @@ static ErlDrvData forker_start(ErlDrvPort port_num, char* name,
+                   bindir,
+                   DIR_SEPARATOR_CHAR,
+                   CHILD_SETUP_PROG_NAME);
++have_child_setup:
+     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) {
+         erts_exit(ERTS_ABORT_EXIT,
+                  "Could not open unix domain socket in spawn_init: %d\n",
+@@ -1635,14 +1661,19 @@ static ErlDrvData forker_start(ErlDrvPort port_num, char* name,
+ 
+     if (i == 0) {
+         /* The child */
+-        char *cs_argv[FORKER_ARGV_NO_OF_ARGS] =
+-            {CHILD_SETUP_PROG_NAME, NULL, NULL};
++        char *cs_argv[FORKER_ARGV_NO_OF_ARGS + 1] =
++            {CHILD_SETUP_PROG_NAME, NULL, NULL, NULL};
+         char buff[128];
+ 
+         erts_sched_bind_atfork_child(unbind);
+ 
+         snprintf(buff, 128, "%d", sys_max_files());
+         cs_argv[FORKER_ARGV_MAX_FILES] = buff;
++        if (erts_aot_exe_path() != NULL) {
++            cs_argv[0] = child_setup_prog;
++            cs_argv[1] = "-erlaot:child_setup";
++            cs_argv[2] = buff;
++        }
+ 
+         /* We preallocate fd 3 for the uds fd */
+         if (fds[1] != 3) {
+diff --git a/erts/etc/common/Makefile.in b/erts/etc/common/Makefile.in
+index a3958304de..7ad956fc31 100644
+--- a/erts/etc/common/Makefile.in
++++ b/erts/etc/common/Makefile.in
+@@ -196,11 +196,13 @@ INSTALL_EMBEDDED_PROGS += \
+ 	$(BINDIR)/dialyzer@EXEEXT@ \
+ 	$(BINDIR)/erlc@EXEEXT@ \
+ 	$(BINDIR)/escript@EXEEXT@ \
++	$(BINDIR)/erlaotc@EXEEXT@ \
+ 	$(BINDIR)/ct_run@EXEEXT@ \
+ 	$(BINDIR)/run_erl@EXEEXT@ \
+ 	$(BINDIR)/to_erl@EXEEXT@ \
+ 	$(BINDIR)/erl_call@EXEEXT@
+-INSTALL_EMBEDDED_DATA = $(UXETC)/start.src $(UXETC)/start_erl.src
++INSTALL_EMBEDDED_DATA = $(UXETC)/start.src $(UXETC)/start_erl.src \
++	$(UXETC)/erlaotc.src
+ INSTALL_TOP = Install
+ INSTALL_TOP_BIN = 
+ INSTALL_MISC = $(UXETC)/format_man_pages
+@@ -263,6 +265,7 @@ endif
+ 	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/erl_io.o
+ 	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/erlc.o
+ 	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/escript.o
++	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/erlaotc.o
+ 	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/heart.o
+ 	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/heart_config.o
+ 	rm -f $(ERL_TOP)/erts/obj*/$(TARGET)/inet_gethost.o
+@@ -496,6 +499,12 @@ $(BINDIR)/escript@EXEEXT@: $(OBJDIR)/escript.o $(ERTS_LIB)
+ $(OBJDIR)/escript.o: escript.c $(RC_GENERATED)
+ 	$(V_CC) $(CFLAGS) -o $@ -c escript.c
+ 
++$(BINDIR)/erlaotc@EXEEXT@: $(OBJDIR)/erlaotc.o $(ERTS_LIB)
++	$(ld_verbose) $(LD) $(LDFLAGS) -o $@ $(OBJDIR)/erlaotc.o -L$(OBJDIR) $(LIBS) $(ERTS_INTERNAL_LIBS)
++
++$(OBJDIR)/erlaotc.o: erlaotc.c $(RC_GENERATED)
++	$(V_CC) $(CFLAGS) -DERTS_VSN=\"$(VSN)\" -o $@ -c erlaotc.c
++
+ $(BINDIR)/ct_run@EXEEXT@: $(OBJDIR)/ct_run.o $(ERTS_LIB)
+ 	$(ld_verbose) $(LD) $(LDFLAGS) -o $@ $(OBJDIR)/ct_run.o -L$(OBJDIR) $(LIBS) $(ERTS_INTERNAL_LIBS)
+ 
+diff --git a/erts/etc/common/erlaotc.c b/erts/etc/common/erlaotc.c
+new file mode 100644
+index 0000000000..0f8f5e69a2
+--- /dev/null
++++ b/erts/etc/common/erlaotc.c
+@@ -0,0 +1,573 @@
++/*
++ * %CopyrightBegin%
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright Ericsson AB 2026. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * %CopyrightEnd%
++ */
++/*
++ * Purpose: erlaotc - build an executable from a release: the emulator plus
++ * a zip archive of lib/ and releases/.
++ */
++
++#include "etc_common.h"
++
++#include <dirent.h>
++#include <stdint.h>
++#include <sys/stat.h>
++
++#define EMULATOR "beam.smp"
++#define MAGIC "erlaotc " ERTS_VSN "\n"
++
++static const char *release_dirs[] = {"lib", "releases", NULL};
++
++/* Set here, or handled by erl(1) */
++static const char *rejected_args[] = {
++    "-root", "-bindir", "-progname", "-boot", "-config", "-primary_archive",
++    "-args_file", "-emu_args", "-emu_type", "-emu_flavor", "-env", "-epmd",
++    "-extra", "-heart", "-detached", "-compile", "-make", "-man", "-x",
++    "-version", NULL
++};
++
++typedef struct {
++    char **v;
++    int n;
++    int max;
++} args_t;
++
++typedef struct {
++    char *name;      /* name in the archive */
++    char *path;      /* path in the file system */
++    uint32_t crc;
++    uint32_t size;
++    uint32_t offset; /* of the local file header */
++} entry_t;
++
++static entry_t *entries;
++static int n_entries, max_entries;
++static uint32_t crc_table[256];
++
++static void error(const char *format, ...)
++{
++    va_list args;
++    fprintf(stderr, "erlaotc: ");
++    va_start(args, format);
++    vfprintf(stderr, format, args);
++    va_end(args);
++    fprintf(stderr, "\n");
++    exit(1);
++}
++
++static void usage(void)
++{
++    fprintf(stderr,
++            "Usage: erlaotc [-o Output] ReleaseDir [Arg ...]\n"
++            "\n"
++            "Builds an executable from the release in ReleaseDir. Arg ...\n"
++            "are arguments for erl(1), given in addition to those in\n"
++            "releases/Vsn/vm.args; $ROOT in them refers to the executable.\n");
++    exit(1);
++}
++
++static void *emalloc(size_t size)
++{
++    void *p = malloc(size);
++    if (p == NULL)
++        error("out of memory");
++    return p;
++}
++
++static void *erealloc(void *p, size_t size)
++{
++    p = realloc(p, size);
++    if (p == NULL)
++        error("out of memory");
++    return p;
++}
++
++static char *strsave(const char *s)
++{
++    char *p = emalloc(strlen(s) + 1);
++    strcpy(p, s);
++    return p;
++}
++
++static char *join(const char *a, const char *b)
++{
++    char *p = emalloc(strlen(a) + strlen(b) + 2);
++    sprintf(p, "%s/%s", a, b);
++    return p;
++}
++
++static void args_add(args_t *args, char *arg)
++{
++    if (args->n + 1 >= args->max) {
++        args->max = args->max ? args->max * 2 : 32;
++        args->v = erealloc(args->v, sizeof(char *) * args->max);
++    }
++    args->v[args->n++] = arg;
++    args->v[args->n] = NULL;
++}
++
++/* As -args_file of erl(1) */
++static void read_args_file(const char *path, args_t *args)
++{
++    FILE *f = fopen(path, "r");
++    char *buf = NULL;
++    size_t size = 0, len = 0, n;
++    char *p, *cur;
++    enum { Start, Build, SQuoted, DQuoted, Escape, Comment } state;
++
++    if (f == NULL)
++        error("cannot open %s: %s", path, strerror(errno));
++    do {
++        buf = erealloc(buf, size += 4096);
++        n = fread(buf + len, 1, size - len - 1, f);
++        len += n;
++    } while (n > 0);
++    if (ferror(f))
++        error("cannot read %s: %s", path, strerror(errno));
++    fclose(f);
++    buf[len] = '\0';
++
++    cur = emalloc(len + 1);
++    n = 0;
++    state = Start;
++    for (p = buf; ; p++) {
++        char c = *p;
++        switch (state) {
++        case Start:
++            if (c == '\0')
++                goto done;
++            if (c == '#')
++                state = Comment;
++            else if (!isspace((unsigned char)c)) {
++                p--;
++                state = Build;
++            }
++            break;
++        case Build:
++            if (c == '\0' || c == '#' || isspace((unsigned char)c)) {
++                cur[n] = '\0';
++                args_add(args, strsave(cur));
++                n = 0;
++                state = Start;
++                p--;
++            } else if (c == '"')
++                state = DQuoted;
++            else if (c == '\'')
++                state = SQuoted;
++            else if (c == '\\')
++                state = Escape;
++            else
++                cur[n++] = c;
++            break;
++        case DQuoted:
++        case SQuoted:
++            if (c == '\0')
++                error("%s: unterminated quote", path);
++            if (c == (state == DQuoted ? '"' : '\''))
++                state = Build;
++            else
++                cur[n++] = c;
++            break;
++        case Escape:
++            if (c == '\0')
++                error("%s: unterminated escape", path);
++            cur[n++] = c;
++            state = Build;
++            break;
++        case Comment:
++            if (c == '\0')
++                goto done;
++            if (c == '\n')
++                state = Start;
++            break;
++        }
++    }
++done:
++    free(cur);
++    free(buf);
++}
++
++static int is_flag(const char *arg)
++{
++    return (arg[0] == '-' || arg[0] == '+') && arg[1] != '\0';
++}
++
++/* As erl(1): +Flag and its values go to the emulator, the rest to init */
++static void split_args(args_t *in, args_t *emu, args_t *init)
++{
++    int i, j, emu_flag = 0;
++
++    for (i = 0; i < in->n; i++) {
++        char *arg = in->v[i];
++        if (strchr(arg, '\n') != NULL)
++            error("argument with a newline: %s", arg);
++        for (j = 0; rejected_args[j] != NULL; j++) {
++            if (strcmp(arg, rejected_args[j]) == 0)
++                error("%s cannot be given to an executable", arg);
++        }
++        if (arg[0] == '+' && arg[1] != '\0') {
++            arg[0] = '-';
++            args_add(emu, arg);
++            emu_flag = 1;
++        } else if (emu_flag && !is_flag(arg)) {
++            args_add(emu, arg);
++        } else {
++            args_add(init, arg);
++            emu_flag = 0;
++        }
++    }
++}
++
++static void crc_init(void)
++{
++    uint32_t i, j, c;
++    for (i = 0; i < 256; i++) {
++        c = i;
++        for (j = 0; j < 8; j++)
++            c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
++        crc_table[i] = c;
++    }
++}
++
++static uint32_t crc32_update(uint32_t crc, const unsigned char *p, size_t n)
++{
++    crc = ~crc;
++    while (n-- > 0)
++        crc = crc_table[(crc ^ *p++) & 0xff] ^ (crc >> 8);
++    return ~crc;
++}
++
++static int cmp_names(const void *a, const void *b)
++{
++    return strcmp(*(char *const *)a, *(char *const *)b);
++}
++
++static void collect(const char *dir, const char *name)
++{
++    DIR *d = opendir(dir);
++    struct dirent *ent;
++    char **names = NULL;
++    int n = 0, max = 0, i;
++
++    if (d == NULL)
++        error("cannot read %s: %s", dir, strerror(errno));
++    while ((ent = readdir(d)) != NULL) {
++        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
++            continue;
++        if (n >= max)
++            names = erealloc(names, sizeof(char *) * (max += 64));
++        names[n++] = strsave(ent->d_name);
++    }
++    closedir(d);
++    qsort(names, n, sizeof(char *), cmp_names);
++
++    for (i = 0; i < n; i++) {
++        char *path = join(dir, names[i]);
++        char *ename = join(name, names[i]);
++        struct stat st;
++
++        if (stat(path, &st) != 0)
++            error("cannot stat %s: %s", path, strerror(errno));
++        if (S_ISDIR(st.st_mode)) {
++            collect(path, ename);
++            free(path);
++            free(ename);
++        } else if (S_ISREG(st.st_mode)) {
++            entry_t *e;
++            if (st.st_size > 0xffffffffu)
++                error("%s is too large", path);
++            if (n_entries >= max_entries)
++                entries = erealloc(entries, sizeof(entry_t) *
++                                   (max_entries += 256));
++            e = &entries[n_entries++];
++            e->name = ename;
++            e->path = path;
++            e->size = (uint32_t)st.st_size;
++        } else {
++            error("%s is neither a regular file nor a directory", path);
++        }
++        free(names[i]);
++    }
++    free(names);
++}
++
++static void put16(FILE *f, unsigned v)
++{
++    unsigned char b[2] = {v & 0xff, (v >> 8) & 0xff};
++    fwrite(b, 1, 2, f);
++}
++
++static void put32(FILE *f, uint32_t v)
++{
++    unsigned char b[4] = {v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff,
++                          (v >> 24) & 0xff};
++    fwrite(b, 1, 4, f);
++}
++
++static void copy_file(FILE *out, const char *path, uint32_t *crc)
++{
++    FILE *in = fopen(path, "rb");
++    unsigned char buf[65536];
++    size_t n;
++
++    if (in == NULL)
++        error("cannot open %s: %s", path, strerror(errno));
++    *crc = 0;
++    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
++        *crc = crc32_update(*crc, buf, n);
++        fwrite(buf, 1, n, out);
++    }
++    if (ferror(in))
++        error("cannot read %s: %s", path, strerror(errno));
++    fclose(in);
++}
++
++/* Uncompressed and with a fixed timestamp, so builds are reproducible */
++#define ZIP_TIME 0
++#define ZIP_DATE 0x21 /* 1980-01-01 */
++
++static void write_executable(const char *out_path, const char *emulator,
++                             args_t *emu_args, args_t *init_args)
++{
++    char *tmp_path = emalloc(strlen(out_path) + 5);
++    FILE *out;
++    long offset;
++    uint32_t cd_offset, cd_size;
++    int i;
++
++    sprintf(tmp_path, "%s.tmp", out_path);
++    out = fopen(tmp_path, "wb");
++    if (out == NULL)
++        error("cannot create %s: %s", tmp_path, strerror(errno));
++
++    {
++        uint32_t crc;
++        copy_file(out, emulator, &crc);
++    }
++
++    for (i = 0; i < n_entries; i++) {
++        entry_t *e = &entries[i];
++        uint32_t crc;
++
++        offset = ftell(out);
++        if (offset < 0 || offset > 0xffffffffL)
++            error("the executable would be too large");
++        e->offset = (uint32_t)offset;
++
++        put32(out, 0x04034b50);
++        put16(out, 20);          /* version needed to extract */
++        put16(out, 0x0800);      /* flags: UTF-8 names */
++        put16(out, 0);           /* method: stored */
++        put16(out, ZIP_TIME);
++        put16(out, ZIP_DATE);
++        put32(out, 0);           /* crc, see below */
++        put32(out, e->size);
++        put32(out, e->size);
++        put16(out, (unsigned)strlen(e->name));
++        put16(out, 0);           /* extra field length */
++        fwrite(e->name, 1, strlen(e->name), out);
++
++        copy_file(out, e->path, &crc);
++        e->crc = crc;
++        offset = ftell(out);
++        if (fseek(out, (long)e->offset + 14, SEEK_SET) != 0)
++            error("cannot write %s: %s", tmp_path, strerror(errno));
++        put32(out, crc);
++        if (fseek(out, offset, SEEK_SET) != 0)
++            error("cannot write %s: %s", tmp_path, strerror(errno));
++    }
++
++    offset = ftell(out);
++    if (offset < 0 || offset > 0xffffffffL)
++        error("the executable would be too large");
++    cd_offset = (uint32_t)offset;
++    for (i = 0; i < n_entries; i++) {
++        entry_t *e = &entries[i];
++        put32(out, 0x02014b50);
++        put16(out, 20);          /* version made by */
++        put16(out, 20);          /* version needed to extract */
++        put16(out, 0x0800);
++        put16(out, 0);
++        put16(out, ZIP_TIME);
++        put16(out, ZIP_DATE);
++        put32(out, e->crc);
++        put32(out, e->size);
++        put32(out, e->size);
++        put16(out, (unsigned)strlen(e->name));
++        put16(out, 0);           /* extra field length */
++        put16(out, 0);           /* file comment length */
++        put16(out, 0);           /* disk number start */
++        put16(out, 0);           /* internal attributes */
++        put32(out, 0);           /* external attributes */
++        put32(out, e->offset);
++        fwrite(e->name, 1, strlen(e->name), out);
++    }
++    offset = ftell(out);
++    if (offset < 0 || offset > 0xffffffffL)
++        error("the executable would be too large");
++    cd_size = (uint32_t)offset - cd_offset;
++
++    {
++        size_t comment_size = strlen(MAGIC);
++        for (i = 0; i < emu_args->n; i++)
++            comment_size += strlen(emu_args->v[i]) + 1;
++        comment_size += 3; /* "--\n" */
++        for (i = 0; i < init_args->n; i++)
++            comment_size += strlen(init_args->v[i]) + 1;
++        if (comment_size > 0xffff)
++            error("the arguments are too long");
++
++        put32(out, 0x06054b50);
++        put16(out, 0);           /* this disk */
++        put16(out, 0);           /* disk with the central directory */
++        put16(out, (unsigned)n_entries);
++        put16(out, (unsigned)n_entries);
++        put32(out, cd_size);
++        put32(out, cd_offset);
++        put16(out, (unsigned)comment_size);
++        fputs(MAGIC, out);
++        for (i = 0; i < emu_args->n; i++)
++            fprintf(out, "%s\n", emu_args->v[i]);
++        fputs("--\n", out);
++        for (i = 0; i < init_args->n; i++)
++            fprintf(out, "%s\n", init_args->v[i]);
++    }
++
++    if (fflush(out) != 0 || ferror(out))
++        error("cannot write %s: %s", tmp_path, strerror(errno));
++    if (fchmod(fileno(out), 0755) != 0)
++        error("cannot chmod %s: %s", tmp_path, strerror(errno));
++    if (fclose(out) != 0)
++        error("cannot write %s: %s", tmp_path, strerror(errno));
++    if (rename(tmp_path, out_path) != 0)
++        error("cannot create %s: %s", out_path, strerror(errno));
++    free(tmp_path);
++}
++
++static char *bindir(const char *argv0)
++{
++    const char *env = getenv("BINDIR");
++    char *dir, *p;
++
++    if (env != NULL && env[0] != '\0')
++        return strsave(env);
++    dir = strsave(argv0);
++    p = strrchr(dir, '/');
++    if (p == NULL)
++        error("BINDIR is not set");
++    *p = '\0';
++    return dir;
++}
++
++static char *release_version(const char *release_dir)
++{
++    char *path = join(release_dir, "releases/start_erl.data");
++    FILE *f = fopen(path, "r");
++    char erts_vsn[64], rel_vsn[256];
++
++    if (f == NULL)
++        error("cannot open %s: %s", path, strerror(errno));
++    if (fscanf(f, "%63s %255s", erts_vsn, rel_vsn) != 2)
++        error("%s: expected \"ErtsVsn RelVsn\"", path);
++    fclose(f);
++    if (strcmp(erts_vsn, ERTS_VSN) != 0)
++        error("the release is for erts %s, this is erts %s", erts_vsn,
++              ERTS_VSN);
++    free(path);
++    return strsave(rel_vsn);
++}
++
++int main(int argc, char **argv)
++{
++    const char *out_path = NULL;
++    char *release_dir, *emulator, *rel_vsn, *path;
++    char release_path[MAXPATHLEN];
++    args_t in = {0}, emu = {0}, init = {0};
++    struct stat st;
++    int i;
++
++    for (i = 1; i < argc && argv[i][0] == '-'; i++) {
++        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
++            out_path = argv[++i];
++        } else if (strcmp(argv[i], "--") == 0) {
++            i++;
++            break;
++        } else {
++            usage();
++        }
++    }
++    if (i >= argc)
++        usage();
++    release_dir = argv[i++];
++
++    emulator = join(bindir(argv[0]), EMULATOR);
++    if (stat(emulator, &st) != 0)
++        error("cannot find the emulator %s", emulator);
++
++    if (realpath(release_dir, release_path) == NULL)
++        error("%s: %s", release_dir, strerror(errno));
++    if (out_path == NULL) {
++        char *base = strrchr(release_path, '/');
++        out_path = strsave(base != NULL && base[1] != '\0' ? base + 1
++                                                            : release_path);
++    }
++    rel_vsn = release_version(release_path);
++
++    path = emalloc(strlen(release_path) + strlen(rel_vsn) + 32);
++    sprintf(path, "%s/releases/%s/vm.args", release_path, rel_vsn);
++    if (stat(path, &st) == 0)
++        read_args_file(path, &in);
++    for (; i < argc; i++)
++        args_add(&in, argv[i]);
++    split_args(&in, &emu, &init);
++
++    args_add(&init, "-root");
++    args_add(&init, "$ROOT");
++    args_add(&init, "-bindir");
++    args_add(&init, "$ROOT/bin");
++    args_add(&init, "-progname");
++    args_add(&init, "$ROOT");
++    args_add(&init, "-primary_archive");
++    args_add(&init, "$ROOT");
++    args_add(&init, "-boot");
++    sprintf(path, "$ROOT/releases/%s/start", rel_vsn);
++    args_add(&init, strsave(path));
++    sprintf(path, "%s/releases/%s/sys.config", release_path, rel_vsn);
++    if (stat(path, &st) == 0) {
++        args_add(&init, "-config");
++        sprintf(path, "$ROOT/releases/%s/sys", rel_vsn);
++        args_add(&init, strsave(path));
++    }
++
++    crc_init();
++    for (i = 0; release_dirs[i] != NULL; i++) {
++        char *dir = join(release_path, release_dirs[i]);
++        if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
++            error("%s is not a release: no %s directory", release_path,
++                  release_dirs[i]);
++        collect(dir, release_dirs[i]);
++        free(dir);
++    }
++    if (n_entries > 0xffff)
++        error("too many files in the release");
++
++    write_executable(out_path, emulator, &emu, &init);
++    return 0;
++}
+diff --git a/erts/etc/unix/Install.src b/erts/etc/unix/Install.src
+index 45f75c0e49..553fe0a405 100644
+--- a/erts/etc/unix/Install.src
++++ b/erts/etc/unix/Install.src
+@@ -88,6 +88,14 @@ chmod 755 erl
+      start.src > start;
+   chmod 755 start)
+ 
++#
++# Create the erlaotc script, which runs erts-%I_VSN%/bin/erlaotc
++#
++sed -e "s;%FINAL_ROOTDIR%;$TARGET_ERL_ROOT;" \
++    -e "s;%VSN%;%I_VSN%;" \
++    erlaotc.src > "$ERL_ROOT/bin/erlaotc"
++chmod 755 "$ERL_ROOT/bin/erlaotc"
++
+ cd "$ERL_ROOT/bin"
+ 
+ cp -p "$ERL_ROOT/erts-%I_VSN%/bin/erl" .
+diff --git a/erts/etc/unix/erlaotc.src b/erts/etc/unix/erlaotc.src
+new file mode 100644
+index 0000000000..595a1a7ec6
+--- /dev/null
++++ b/erts/etc/unix/erlaotc.src
+@@ -0,0 +1,54 @@
++#!/bin/sh
++#
++# %CopyrightBegin%
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++# Copyright Ericsson AB 2026. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# %CopyrightEnd%
++#
++
++absolute_parent() {
++    DIR=$(dirname "${1}");
++    (cd "$DIR" && pwd -P || echo "/");
++}
++
++find_rootdir() {
++    CANDIDATE="${1}";
++    while
++        CANDIDATE=$(absolute_parent "$CANDIDATE");
++        [ "$CANDIDATE" != "/" ] && [ ! -d "$CANDIDATE/erts-%VSN%" ];
++    do :; done;
++
++    if [ "$CANDIDATE" != "/" ]
++    then
++        # It is likely that the files have been copied or moved
++        echo "$CANDIDATE";
++    else
++        echo "${2}";
++    fi
++}
++
++if [ -z "$ERL_ROOTDIR" ]
++then
++    ROOTDIR=$(find_rootdir "$0" "%FINAL_ROOTDIR%")
++else
++    ROOTDIR="$ERL_ROOTDIR"
++fi
++
++BINDIR="$ROOTDIR/erts-%VSN%/bin"
++export BINDIR
++exec "$BINDIR/erlaotc" ${1+"$@"}
+diff --git a/erts/preloaded/ebin/erl_prim_loader.beam b/erts/preloaded/ebin/erl_prim_loader.beam
+index c957d18a9f06896f3bf3b62e7c8cf5589b75ca51..c46c63edc255c95e9a662b8bd4d7da8fe8a1ee30 100644
+GIT binary patch
+literal 26136
+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
+PZ7b%%VophCc;EjIOF9FO
+
+literal 24088
+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
+JWT~6${{b>O7q9>T
+
+diff --git a/erts/preloaded/ebin/init.beam b/erts/preloaded/ebin/init.beam
+index 144ad26d90283e8f596b5254ac660e0d42dcec15..9183a111c293008d2fbc37f72ed90347836a7564 100644
+GIT binary patch
+delta 12729
+zcma)D33wCL+RkKBNMq5V6DX^UCg@4RKp+893OL>D3@}ijTG@+GWLPUAA{U*iC=7ZP
+z40`XlP!JSHwqlV*1VsfMMMQDK6?fxy-S;d1dnQRK@IU|a^EjQeeee0scfReMiJRVG
+z9)6$EFCH<fx63tGC@C*ihiP+aT`rH{YX0Xgbh+HEXf>1w6^4pJ14DyD7louyai}Cz
+z8j?e5Xn3ePG$AxGv^;cIXmzL|^iXJXXiI2YXh-N^=*7^hp|?Wsg+2;>9{M8mox&=u
+z6p!Ln3Y5-DSP_-piXK<`DFYQ%8Lo^_Mk=F~OO!FnMCEctQ)VdBl_|;<%3S42Wu7u$
+zxmvka`G<0ya-(vyVkpa%q_Rr6OSw<EUs<g@psZ6Y<q>6zvR&D!Y*Y3thm|*!H<hEx
+z+sY1QkMflAlCn>EPkCSYRQXK#TuCWEDL*SGG?%Winn%mga<w*ED=lAZuXWM7Y3;Pm
+z+WA^QBicx9lr~Tsq+O<!Xl2?kZMfD?leGa_Lc3J!qs6uH+7xZNHcOkWX<A5ItX-$+
+znxWmU-JvD525p_TR$HTO&^Bs2w4K@}tx4OiZPRvZk869hecF@SQ<}bCds=%&JE*;+
+z9oF8`j%jae?`ZF8?`g-iPqZ(zl=ijuqxOsTyY{!?Hu8)%Mth^9(Z%R$oM&8UM2sFr
+z%!nI(jX}m>qu3}h%8ijmm2rtN#+YQ(7?&GUjap-xafPwKxW-sy++Zv-?l4vwtBku1
+z)40dD-&n01YmJS@W@D?-XlyecHJXg=#$(0~W2dpp*lj#+>@l7&_8HF@2aJP;Z5%dU
+zHjWx^7;hTKjJJ(<jN`_K#wSL~_|o{+_}=)z_{I3$IAOUgx5Zi>E5~YW<yt<gjn&r5
+zx7u4Btj^ZCRyXTBD`0iEdRPOk36?&{8f;x+m0LAdt#ySp-O{WX)*S0<Yk{R(_0~e`
+zT5FN@4{Nb?leNUU*;;Oy)_vCf)@o~wwbt5TJ#0N<ZLzjmjaHMj-P&R8w02p0ttYMh
+z*0a`g*7Md2){E9*>t*Yx^_umT^{(}W^_BIb^^5hlb;53Cx3;~yeU{zH?re9n&$GMR
+z344G&$R2E8WS7_%+ZFZ@d#F9kCU)44*rMIbj@og1ggx3GXHT#v*)?{pJ<XnBUt=${
+z7u(m{%k10jJM25{d+pVBgT2RIYj3b0wk>;|z21J%-evE$H`-h5t@dMflfA=!);?&z
+zXzMT8N9{N4_w4uWPwfxv5AEajNA@T7$9Bs8%Kp~=&Hg>*P35NAr3zB#rn;p9sbK2D
+z6iJDxo~d}Mf2t@oC?%yTQbSW!sqv`^sfnpsskx~uQ+27UQVUYorLIrikh(FoEcMUS
+z%G6z{yHoe4R;L<LYf|e{>r)S=9!gmQQ;(!JrZ%Ovr5;T+rFN$tPwh=TnR+VqOzJ@D
+zrPLd#w^G|vkEM*%^3<)VCDsA!R_iuvg>|u2Vab+~40@*IOgnMn?-fnAc~-T)%*$U@
+zJAYE$JZ<*mdDl*wJa5W$Z9(mKr`1=``lM;vtlH!AY9~*1N|UrX)8=~5pMCYL`C8qq
+z+S4JD?eo5C;@Zq)nwFp4)!U_X?o_y`AsgV8xQwUT0XKCV<;_jcwm;(O_<IS<`6bpP
+z`FW{NK=Q>{(;M?dRg&D?xeGJD>4na_-OQw>CFkz;Fe8(L13j2en`Q>?_b`K!xnvL1
+zujv3;$}nY3YB<3#!KPaxPczJyNktsXeBZQQoaknTHL=nBR{BI~etLo}nBWIYAWCeR
+zG#`~8J)Ag0V&hU7DnEI+HeDr_m*N3w3G0c9k~8LKjH#BYc&GA<M-Zo@VtRi?X_mwW
+zDYowda32K3Z<Kq$OpsWAcG9i1<M(U_7v<LT1%j`U#lokr5{FB^ZRr0axusvHv;G9;
+zWQkp6djCou?blQPFY1e>sqCf#ZmQ}18;m@kMn%K?w7gDafs3kHNgP!m^$|z<B4Q;&
+zDox_@xYUInPF<AaQWvaY$VjP#&0oVaWR&SWF@$BvXp=DRd|wmCkg7ZvM;Gtg&YHyS
+z5!6A2$@>0Lo%M3wJ}!n_Y7!5I?!eIMJb~L(Ab7BM7{3$abDZ(w*lKnS_LMDVc{U-A
+z;fwhI9~Z||^NsW`+b9JvwiV=41NoSwb!*Psw?Q1w3MHU|2<HNBZcOrHl()6y?N=y{
+z)7b&yI1FH2d=W2>E0BC4@v;(ZF}aMBIFNbPvjx!#Z%4mJ^7xl=oJn$9b1umP3?F43
+z{Em@)kE41PtqKeoOQj${3ga*hmBM(iBI7;5Bzaik9*|7TN<)7Flx@<>n{>+ZCh_Zd
+ztZtICI&?Kkz6hJ|0`4Tqw-;1rXCzl+l5+sN4^vOh;{>Yk74_)nu)9<4$zfTpK&bF`
+z^5k=%z1$>iG5ARgo{|u!@j8`ZgIF67d{31GxIjXj8Ym9LGVjtr9CeCOSs=tpTLF+E
+zQzhSiz~>Lgav4&aZk!euFXw@Og-LkeKMnlp8D@A^s_=H^P2z7Yc=II>FR_7T5TUOZ
+zj6hdO4))8%5X~g*K=}-$Gb4|Ku6Ug7e-=}<hkT;Yvtf8-2f!ow4xpnT(;-`QKRQqY
+zLy5kq9k9?L)>-vTlXL|3L2xxIPY|Hq9*OrS#M!J4T?$0R*?evgRV+PI8+A%;#Q#yN
+zI;F1{*4l-46tR=DT&Qq`w=0`1`!glaAaM>uW=lF9Zj#RFeh)+DII7hJwm82~oSV@I
+zN1f(I#Cb46-*Z#~6w@SKPr_nNY57vkKQ~QY*OI(0B3_vxXO{^slXPp%9pUt}oP5t`
+z?eI#Nhtn<4?o6+p?VShioZj>Px8AEvay}I^ws5{<!w@rNCjdii-ymMgMyVl!?;slb
+zH;4<_Xs++Y5?1i^7Z)a99?(_qj?ovic6k$p;v!h)qO@gF>xFeLa;$SfiFh?bu7-#Q
+ziPtb>f#im1T|<3*#y&6f2yHrWQ5W6+lC;(@gjuI;@><9*U0Q^hsCE9sBm_*q1l?HN
+zHzD2v?-Ga=ic13ns{@td(t;XJyjc*hkBZkZ<hqi8t281mE%hBP2?(VaRXRXinp{&<
+ztcE<%OB^QH95_{gT~Eitq(&E&0%eV_NL=FEBHrkGS-i=2M6CCX6m^E^dC?kav`32h
+zB|ccf3#=4?HiVNs2X+ib{HNg6_ZOFr&J${+7}ebpzK)HEHza2c40h>(sTp#^DWh*J
+z;iDLEQ*z_LqJVfhZ#PLX7IwRsAxp4^(R2;DgJOEm)5qP6HNZNS27Iq@jZz6;&z_Z2
+zPnD=U`<U<5HPw72VhwF*#=9jhE@j~W;R=>!wdW{yyjR*=EHg<I!hQ|%G4i4?MC#@F
+zph<eewDrS|w)FA1#JgesCW)c+?;=*bjfS0D5q6d{WVz%CNI{-zX%tEvM|^sbI$Y`)
+zZ>5$I44^M3D&8Jt$Zf!&d;Cw6^u@HVqv`fMA?nzF0IJpx_EXp(u1rS=oi7wu@&oV)
+zB|LS7cLbp8jxF~Gdpoo1c@yhNWSs9EadBm!gm)o2ptTUg4w_^D)O$cgT)~z&twm_v
+zk7$xx$s;yLd0!>##GrwGYE3kx48n*fB;w(rJ4sm23SiKPu@Wp&{_ix&VDNtoVoN5(
+zRml$rchN6`d;gSM;mWOKX~g$?%6Yeg&-yC)WrE;LA)VBrB#2j~cjhjW6a(&U7ensm
+z`bTL3C2+2d^=tu^;=fE%g5Gz~`|ms#{Peq6St*uO6cJ6fSn|D(dYPVWXxki@Ov(2F
+zy2>G%A`stWl8b?JTw=(*d4eSI)EP*zv~#Qg_xD34<sLU*j&Ke!Kn5~xVcl%Ghh=kU
+zl_B?;L<Y)-0z>Xkhz-;_*{HZWpkp6tjNtvw1}R{t9V`H_YpI679k4W9qtls5z)Wm9
+z7_2^(a>)OKqybI_l38Ptq2T2s@Um7<i0d3z5fRq~a)WtMDXYwqn}<1=WEg-SL}KBm
+zS%kA2DwrI&T6~~7SYIGivqxCT6I>=>|A*6@g#(Ydy*#l05ncpJto;GF`E#39y)x_U
+zE4<y<);flmWF*|MNk(OqaUFPEZ<5jA@e}a)U_#vB$SWc~6v*w>9F8IAVHsU!)Bf=x
+zPKcHVcpg6CL56IIi|g4ummu+2MODkuZpX|XHpwOK{`tO7F^3fqAK`r!nD~)&&^F1X
+z$O=c(*zJKUR5xQC8%<ITo<76)P06jr?exnann!6C7ZDqg-&A;ogxCmHSp?z6U~$k7
+z;~zsOw*0J=+Y=%g3yNJdON)q`K~WvAqmhJG*hXqbn+l?yVB93*K=p{jGNkFR@Sexh
+zz-W^3j_@kH=Ti;Q_c=LvaFDo#A)BQjs09z4&;$@}pv00tAjP3UaYwf%Qd+8+4j!}>
+zDLf_d$6JE#lgi@A*BP<}y(XE2y&lvcZcV!umX?nDK1Zwr)B0A{_XS4fS3+)E!C)Lb
+zn4~66(%4MWc#@=%QUuc!jW|v?q}xm~8FEcQu8&IYnB)$$lEm!{X)?*>v|VDz_Jp_t
+zf-S|YkCo>3LV8#pi0LPXKE?@^<)wiP;f}c2#HPnkecx%4DZu#>_`4)FL-aU9cAI1>
+zZ3q723Gs;x{+`m@o?J9a!)}05?>Pw#nkTrZM7!KEo(Yk?CaDF&S3usE5cdKhz$U~e
+zS!$XAYSbo~hK<^nOqF)-@g#Nucu$$+3ebFA$&medLZwvd_!DH80oYr>B-2|*y@Qj{
+zvaY)3XUNk9;z71hJirdDW-G-51(F~>8x@~n$TL)nXhsnc4+Ki^hp+b3w4)p2BsMd!
+z39)QIc{Vc^(mTNVYO{kSUu`;vIM6|Snjr@}(!bA{WG2}AhGTT{d_sHyYvGDn92<Ny
+zvA44T+o^|Wv%a~##TQwG0+Y;!`dq{i8@?f%yUao2_7XK59K~QbFT};?GST!!V9-!-
+z$Ru+y&41AQQla=(dU=QF@?Mj~!wflG!sbvbIh3p{@2J;dTB%SxhFt2{DY?`!Czm?v
+z8za8Vke4Iku|Qc#l@KqfiUy}wiAQJ@g#na-^DC)XwW|CYY{8KkRau`~6%k*hnLr3{
+z-uJyp<}J=~d5ayov?m0yPUe9cLVktq12AZMnMtk!Pu=JVnHmuXo1Kq_c6cq$;k?Dw
+z!A5F$=m|Rhhjx~7Pa!N+cmr%XESP1><9I5(LHsRqO5Is%k8yxsjp1c@xYk@FL-<!D
+z-}k&!g|lCXUF$62)#Rd!yXXs?Gh8NFFv&IEsJA@IkfT(W%GhN!$Sf8@|K6uQ853Us
+zIb7QU8K`Jk<mKvI40$c>mJad0U-Kj!T%#U;9QqY>Z2BM6vrmtUZ<=H=04{D2-$fRz
+zqaTqO7}q)OhV>-G*VzYHxQW+U!S@Hc28nMl<aLO_FSW(E>p@(>RXT?n-ydu_OI;r4
+zq0|g{!z45u%LsW5;yc)9lhh-LR!aOFZ?TRCgsKf`5Z`8_VYe2SL?lcS_VdjdaZYLu
+zqw(?}T`DAdA(bZwk9Y%JbaH=1d;P7rcqpTa$4pX3Rq<_1L$j23Fg<<0i#5{sdnUQj
+zogZdl-0vf8|FA#`d&J}69PtB&e1MQfXq@?&A;&Yvyl^Wl@FvVu<b?kUZ;0{`X44Tw
+z{1~eKA;Nw3*k+O?7~5@Ij*F}J6nOJ}zq{()uH19Ot%Z6wqH5Udw0O_m1~F0rn&f6m
+z&?2{R&Ql+m<QA}*3pPKdv61(fWN8{%;*blSf~=nc9a@{sTb$$NCni}2Bp;AIO-EUi
+z7?AkTLh%b&-WSc5$3h%mIF|Q0EblXhd=^2khq@bjIRBj1!g=)Uf{e~r>2Z$9xW6IG
+zb$`|;ec_yC=<t+DZpE~1AfGQGN~#Yu?1s+{Na1rpbQ`_9=^_4y4WB*OBYtI)e`0ko
+z3@=pXtBX7$dT92?(d>`gxPmR9N3+|}ufoU~@^yjuEj;KqSiv`}E}V3Q->|+>5%C+x
+zZ^BnOtbfx%{F))(cBFs*gOt>1{LUnIfI*tde4pNHhWt<<{shz?f%@Y~xkOO$t-#+j
+zD81>REBvv8_ya?JYA^ZpOv}$ESpi5MkiWD+5(7>%2{4$F^09!GaQ?q`5`Xoyha8*x
+zRycik`W@KcOp*kMA0WRYXgZ;jN9g>MA%B=;744E3@@GQzuz5Ae>mb+UD?|L}-G%E0
+zFJ>$h|H8?d=6Td}BZZSpayR-qBwGzVU;h)df6?nQwN=6Ka66R^w^!Za0+k7OP+j4U
+z;)!r4@$YbF@xKiDuT(`HSFmasS80-erF}uxF*-H)Q)D3?epysN6ogI<hZ-Y}M*R@H
+z01^G2W`mlm!^gip4kH_fb}TY+5FQIRjy`zVdqA8|{W?^{AEPk_3kItvP6N2tp+7OS
+zqki8h^!NYo^s?(T`qh*^qb!Kz*pUYKz!6#B^(%ZAA`3VGD_JIFCJO@R3AeL`VvNmd
+z99)=5*3#(#bcsnGz-tr&HsVAuq2}NkkmcieXOA)hxA7@|feQ=W$l*w1l66?fRA=3Y
+z@z|^N$?u1S^as=84raVWx|TkY3AA#mpk=odk4a?#dQ*$@C1h8_$Sfzg%7bUNd*b3B
+zi2pbid!zskxDdia6cXvI^P+cD`WZ9iU}<uYkz1MMF8EiuwMjNW7rP3K?0rbhM~1Qk
+ze+%lu=hkyR(OvIFdLIyWsBPJT6|^nfE$Xi4Vnx-l<7(T2HMye7<&IX*&aG9?%AKeB
+za<5Wz89CP(FN6i%C51a8uabREOHEktQdBS3;p#b3xD)L;D~s*z;DF=B7gh7$0bMFw
+zFnN~Rrf}i>d1@Xb=VdYK9mXb0;m#DGO?EQO)qysg-Q19;XAT$-Ln8i&dJgN0AT~rG
+zDhvBNA#*?ppXVIy<#VKPLAt~>LrCHF6tnHaY#=KbSAF<=_-@>;ngqvyGhp(ia63u^
+zh0-@dwgHZj{Ry=_5>OmQ)OLJ@w+B7XVo1AI;ER#l$5o`5eP~O8Nj8Bdi2dl0P|suY
+zBm|8h?9)l}aP>d~`evxEw@~d!9Yhd!6kueFqfP0nwDf^X?pRc<!$F+yI0yj_q8l8<
+zxo{9&!yVNw;ZADjaA&m>BX`PTY&{dBbGEPX%)Tz!zHMjrbxrr_CVBMC&U3SbO=tFX
+zL!ab{J8Rm0X173%!H=sM=iJvpV&wDUYC-cs^0Af_I7sS{==qQr)%1W#c0jV-ql^rT
+zz5o^-;~UiOF~Jw)>Toi3v-IeIPayQF0Ce5+IBHua*@+Mrq)A%la4%mFR|EX%H1zN;
+zUucqDnBxM>LFh3<$2o(AZ3d*a(1zW}Q%4l45p3H4HF7dACDaf-oW$a4I2J)SFID>`
+zcw*{%<q%q-HQ81gwP<s=xyh+UXpE%oJxuaAI3VCa%)`yAbJ9sqzb8F?PiOj`bb5|W
+zs6Cx1DEFiQ2#0bnlRN={5EL*<4|`Fy4<q+B$zIwB)IJF{?#QlCjl~Aw5lUjXuT*2D
+zh(^e8N@85BJch#_CDi3u8Xz85d(%r9==(56?rV~LIA3raBlk<F{i$ID3e~>+06c<o
+zJj30i%YzFtDEpJx)55e<>qi|tvKEiOoX15AU2p%m+LuZ`VUnl7VHl8w3AM<9jH=9l
+z<cd*#y|Cr(4d|;Tc;r8hWPraPCS2p(=&PrUD~hWLiagLHPlMTf2xJg0EKKqYtWS!o
+zgPqSMxbk&j(BO<KNnaAm7n$T)a1#NIlu-2&2rR%Cs>Oi;cm!N{VxNm+&Pmj{vBDKD
+zI6076DGkNAs=_QS`7UmS21YK4s~7RkRgqk3l7pC~2X>__p<awN$Jj!(9J^AU-Ia1E
+zQ)%*n(SE%=tIp3soy%GRUmRCU*%s=|!vY*_t}w~-z!xD?IiU`rGG*hc!XnmS$x1e#
+zwZS%y1=J?fcS`b*xLQGn3^mCM0O$e$eON*r;p|F69ga^RY#^?x0ZtO=jbg^)RGbqs
+z)$|44i^GwNF!J!YIy3;d5qMKrq%ns8+tbC!BjL_P+BV80FQKg$+D4<TCvB@T$zilb
+z(RK-PdlyZzw)*k05})XnK;ADS+@HT0=@q_W`qfJ_DRH<rj?*+BKH}H>gVbt9zH|nB
+zbakVLkuNJyC$J6bc(&5F6y}2?z7Qw@eMB7}@GXg`W7u#Xl#yVr7^IG6<T05_MAgT!
+zXk_HETRiP(mQ8hc9Lgqng<h-)j6A-BdKn{6=t%!gG|8*rJO<7uwQ-%iJw4*28b{OV
+zGgd*_e9bGYz_=Qdybh8$ij$>2R70RIQy3W^<K95K-WO9$ajwIWY2rc?w@C8T0#$>?
+zOlJq+X->Y2cy)R~jjvI?!dIzI3-?xQ8MziRqF0}ecTV3Yz6k}Li9I*TTXY53<7v>U
+zcI7M_xF46y>XaxWUje;n2cjH3U7y}Toyy2sNBVb$NsiI&0b?^0>MXX6fQ44lg91XH
+zznEn`8;`@-dB-n@`$6r}c_n6iyTwNYbtV92L8g%CY?HhL$o^=V)21?e?!ci=7*4+d
+z;O?w!<9GB7vK0y7yAWd~@;~S9baT){H+XJ=Iu9Fs<*6GSg}GkoZ19zIYf(x5eQ8(y
+zJ?PKKh+60OMY6gxfF{;CLib8WuHz)v`m%y(xTq{BmC@_GWfB7Q`yQdYBef4QQoFK)
+zI+u~>b)<i<GRbl9KhVX<^POw)2>lAzD}X;yEc-)v@KHz|(v7+l&O_rzEgE~{ROUt7
+z$7mZ()r|V4t4;C=KraI50tyP{Xo2~uL!NDO5I;NFlm+~}CEztC`2v8t1jL1ToMTr~
+zxcC&<l!MXS=-_@y+f4Em?rs-DpQLaJi!CThyAB*fY4(jA9jbE!kgqk#*O;XginYke
+zwZ6gNs%-v^TX!9~w>O=9e+$xr?0WIB?LQza2gYKo*CgNJp5hWXsk`u)=?Sh!=XECe
+zo{ke3`Fc2M7RG^8%gM8#=-~>;Qid#lz(%4@Kl}+$`4y<Zk>J3u|L8F6I6m-vJ#h52
+zYpgfPPe4}CazjGBr6qEBNIHf48MK!+s7qNPJcI_~sCpyooab)BcPMp<Z?3w8k#Fpw
+zE@9n_e3QgDs?WqS=LnPh;*oUKa855guHw|2t9dWSF!B=m-O5RhZh-mSO#M9DvgMYz
+zTAy*?OHJ}KO^oop>{oC*Ok!jsp)N<PDji*@E-M{?M=B}hkh%PJT~3X+x;o(Hc)p}m
+z2+-<fdZ6%}63Ho7SI4{@?GBWbMq|x`V=-#8qjBt24MtubSC{czjYK1OEI^YjCyv}|
+zx-ff%i;-```5B+^#xU|f({0%L+o^V-S@6Q0-hth~*h<KCMMCXzC*nx}{%a+|>dHVm
+zaiG49?ozUGY-fEXT;K{uzB8^Ssdq?b^Zk*SrjC(UK{Wt33e((`Q15o)+gUl@&TV<*
+z2hat2^L1CtNO^Z${TBuL*J(iiP6LewkeN{LVQ~*pjLWlPs&6gn?*Z+-CixbVR$=UY
+zh3dU<z4xYFFDgiY?!|XO+#92UMctdcbzD&I110<&>N1Y2;YvKXSN3oLCrsjF3L+<U
+z4*1{|uEwxGaK|_v$oHG%PfRif#nq1O`~};YV3Pl)KjO#@Cixrv;~>a2IQc?Ma~OFo
+z4y|aU^bbVTb-0p@1G+EFjFH#jS&xew^iM$lgRMC67e;;vpEJ-h5iJ`M>ci=Ev(ANK
+zI-%Ooa`g`b!@}1SP)q{FBMEimnG}z-q}T|GO*liG07(sa-JDRjAZf~m2V9<RI^#PW
+zJ_fZ&)wjget(5<*r|npyDO0VR9A)HfdC~O8S_H*F5SO#2%s|=`;h`GTM_EDlh4Q0-
+zc+`~Lkm95wR(*`x=yqR3ZDQmm+|Saxl5k$oPjwnjmyX_^ZJz3B+58waxE&_xkI8Ex
+zgq;a>x1)E3>Mrd5E~LL%&D)7}(Cwb=<hnF9--YaXCnN8UtB=z)J$~An_TU>YV5b50
+ziG;c@1G^Wnd+En!7d|0#IPvV|!E5t35UA)A$-If3$L<CA6O6nsu0Bb@pF9oxDU%cd
+z{0e~YPpHpiz@G;A(<i|TQK1ddmhk(NH%x4=KMnZ(jQmVoeU`#Mdm8)!eAfp2bif}>
+zsLyBMp99)+6rS?^9QdBvES-anbU40QIL~2%gN*!qT(#*0_Nf!-@(cKmj~TQmBfpqX
+z53y~c^fM5W0(gAZLo;5B58wxLx6|)(X^)Ao{uq4-XfNT%10bFO_6{f1SD}M2aC~;b
+zFKsxl9~$ur)rcd|h?g1pW$J%9^)M9n2#U^EXI(wqQZ4bxfZ*pYbr|w$Ts=w|K6)y{
+z@@uBdV#=A7jQn~YS4mGRY`}t{m$Ihp@krvm&N0Dd%J|`$Xqj>=*miFhBjcjJ2MA{Y
+z`%T<|!|}d_Ps%;fG#jfqX0d_c_}Ie8xLFUOaSkSU$KqqHDn;ziyQcRWG|t7y_aG1I
+z8=|7h$nTq84efOtBY%*bR8yI=1V4eSY1&?+yK8r$xEl|HXFMMKLJ~jPbGdTxynu(c
+z(=mte(0_Ey8+hD!=$N<g&@r_9UW@X_nKB)}J6S)apv|`^QL69obWJ`#rJGJ^e!`Qb
+z|G7o^7nE5%zv1~k)BY#ke`U)5#ry9}`9vB5HJ6K)DPD#@=ByTF`YX`PTufV+OLr=h
+z(AFh0h?XxznNAGmm_!Q#{KCB%bWn>igEM7HTb3D*B{CPIO#e}wp?GH*Qk%<|e|U4n
+z#f(5X%N;F)fVl+ErJ3?&nR1r7u`R}5o*v^&HifpAFRZJ=3%}fOb;P?OJ=T4Drc8(5
+z7R(Hw6*^Hb6li%g$~`mXkxf%;+cNsL%Q4tRmr6OT$-G^yopz=!U3Y(gH(h47eJ+aN
+z)=l+-a?NJO&p{btaleDNqidP=S*U~F{bst~<<7Lvq)J2yUdNmMUj{juj@c;F36A02
+znwB%|lQZqx@b==#GBg22EWrIB-nq0)$0sYVXqQ<aMCB~76W&yDvUGHQO7{TXNJ^XA
+z<Ft%+I$s-F%FI8GHsZfEc%Mznnf5U#Q=HX!pF_);_9`k}+HoJ=R7)M8VcLA`Va_UA
+w$G?6}-sy+jLbsb{x;jspJZH|_`NG_~+Brhzchf@VchpU<%vj@2&Yzw59~mKxM*si-
+
+delta 12503
+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
+
+diff --git a/erts/preloaded/ebin/prim_zip.beam b/erts/preloaded/ebin/prim_zip.beam
+index 264b269c65cd59aff6df3bfcc35df96a1a0844d0..876f39cceec22a77ffe1edba37c15209e04c6384 100644
+GIT binary patch
+literal 9932
+zcmbVS3zQVqnXa1Zfm`L=P0dt8^OVABm2w;@>A_*ZaW37A(1_SFqb<Is=g|WVJ=2}(
+z9tRL&^Dq*hqaa#F!zc(MBs(gSmz$7?F;7F3yf&{1W|PfkvmwzWyXWi)``ugB;~=|d
+z_w1Z=slV>yzyJUJuUnVC_J&ngO421KqAiQBUy<ocOOkx6^ugaNAouZCwOL)NE>oAQ
+zE7Tj*R`nKjwR)?1n|i0(sdlMr)b(mkEvOsRyVWh~z3NW&0rg|*M)e`}8Fg5FRz08|
+zR9{e!s4uBU)mPQetFNhFR^L>=u6{%Po_b3CiTYFZ=jy2XuKFwW*XnQ7->YZTzo>sz
+z|6TnLTed50)xN;4vV(Tmo?~BTJ9fmr#17fj_Ek2sm)I-q74|juDm!Vfw%hHL-D!8(
+z-FA<iwR84>z281yKWq=#Pufq}JM9PTyX|}IUH0SlHv3-tE_;LhjJ?-BWWQm*ZlAJ`
+z*gvpevR|{mWxr*A(|*@}-~OxppZ4G4p?F>Viul}kLwrGeVf?oE9q~eZFuozaIleW%
+zBYt1}{`kZ3J#jbwbbN38x%mG0^YH`mgYg&RhvT1)kHlY%f7Z5a-TsLBlp2+!wvBm?
+z@jO5pK$|h^tRzc1k)$0d6Yt~x&Ym6XxlnY=(##L_R7f+%dde%S#(KO}71Ersp7I<b
+zndkPM#UGJP)1Odr?x-Z6{hI_nW8;&@#wU9#&YmqP6URCwh4aJT*aE5fY<cfe#kh%n
+z=RF@R^?PQW*K>^|EiT@)K$0qLaDJ?m@6YtMZ_4C{dotN#y1%_=ppWJ9>As<XzV37n
+zJh?kjT-%=;B>D#v+C@()-Jk8~Ta!rl_viW({T-P?I^UgZ=ZjgPqbJQaWiy?5&L8Z}
+z-1<aMF58_gVTvG*`y=h(n@;p}WD99l>>o&vX0qAznvN{*hd_z`^gtm!lIiQp4s@s6
+zJG#0?vYA4$;4w*bWpjn}$u;RB*P%Vrmmesm(wV-yI<mu})8n4+Pj_^aNu3?t?b%$H
+z$2;A=7M<z-5kA(wNlYC5U`=~xrteI;uQ1S$O^fZ>bVs4+G%ajOp}(Vlqh4F$bBi6B
+z?0I~1Jw1hVameG<k<CK*o@_@k9q-E&^FBT7KU?~`iJr-EmD-CrzA2cK&;T~h=X3qV
+zba#7Kt{3tb3YlCVnd$Lv&)o%6ZEElCD0Z}Wrwd*EnS3$V&pJE$y3g=^yV8Bde(2eq
+z=^qjAT=869uM?vjabJ5@Sf9yz8jM?$?gF=sB*>TY$$cHY>Gq!fTyJ~lynG)F2(?Fj
+zaMBw(x{BG2qn_wo39by8%-5#-y4!O-<E1Ha8>Dkx-K>yKuXob99>(!!eYw6gcQGvB
+zqrP-NtC(Js?jP#hSWLGUGMm!EYlKYgnOrJA*q<q;PXcYftFI?FBs`i+eMXFaFjC6r
+z3Yj8cG;3>z1O_ldE+J-(3NIMz9P+iv<ebi2kJB~KKjIsS3juSi8OV0@4*^~esv+T4
+z#Y}H{STGVi$yA{VY{G5W3zPU5X8IT(A=9C#*wXVvj@_69qaEFVVgsxQukOi_sol8(
+zw|Bao@4~0@7f$P!IlY-a68aD`&s>?l(R2Gr4Y$CD`lg*16=RZ;>hs2q7xLLm5%_aM
+z`!60|B{71i9pP@}&&YE+pYA{DS<CM&zj+IRC_EY&Ad4^?>CJTyz(cv-!e7U|lgV}C
+z{CVz`SJok6)y=E>@B6R(ANrj-GO2D{N|_rGY|tI7g9ZFNIM?xekxXN`Zq%FUogj5T
+zw;sduFKAcDx~o^zTqMb+-r(?YQ<n})N=Pzf$2BWz=IJu4(siZ;Tqhu1%mNmR8kJ63
+zmlH0-up_4m&nvU5Oy@{Q53CIixQT%CMkZKe8ghPJ5bKx`tbIJG=&SbLYnYu;Ls#4s
+z!9H?HcclGF$lN9-4>3y_W{Smv1`8-VP07tqbabMdl03|oN{S(mxTT7k=N$QX6%(6*
+zF;l|Ks>e!qD4^3Tbf)h&Le9MUr4YEDGcy!cVYtIDzicKglPfVYQF8Q@zCRF3yj`Kx
+z2iDeqp9L)zHjaeMU>G~Q#{&*smZ=A?s3I9rMOPrCbJ|d9m?58B2ev_Gh;0K3*V#RZ
+zt!r7mCw<spL1ibC+|jc1qwblCnm;-6nZ4Ao5^oo%q0Ek2dZfx^9%NK!R*YG#EMl>W
+zh)eW9icZP|g#bDPFg*bjgJVkcF;HoZK$TXPVI|c9S5kcru%zZZWJyg~IAVC%lAueB
+ziW*H%$z;+3I^9}qby<7q%&vr1O-qS9my~q{nH6TO^(?l8McSCs9qrPUXqRb4yPQb0
+zi^TvGK##=M7U@*hZMh^k27IR2NT(<Z(Hssbw{n}sF>iCpBp^O38UWY<(^_QE86l?C
+z(2!=($ugPDln7e_d<+)0SbZz&Rw{u{NhTqkIl?qneN73-OyO!9AyW$mScSz_DK42z
+z933;Kt}E8kX&f!xG5M5EqdX(z&6t+8z+rkl4O&%Zg2lMkvIsa#fpLGK59_aLlM=~*
+z19vr(3KQD~6=9GWE}6O<i)XrI+OjU0T<DVNKytDplUa@QBIW9&;?Rpj%%rm!HDzML
+zts=Gb;)rJGB@PBRaU`lZ+{}R6h$zt(#e&0=*&m*&2r&#HhT>1UXpzF%1F<j=vt(lF
+zrqf~w25?i(=i&x>iNfPs=ke_v){T&E9I}i<iZ#KZb7XRf?&#PZ&_U%HD|JaGm%3yo
+z)CfV1ISZ%_SR8o%VhaHsgk>)*TNcrZm{lsl2g=#?^im#m*z_`&%mRZcx=d>K(#w^^
+z+sGqOH2_tiGE<mgF~wlo6zpkUXY$x1vkBZ@CYSqOS?7|Az+)=9u4trl;XiW~;HMk&
+z>0I!Tj0QZ%B`#AWE;6@)IznGRp8+ok5;;tpHfDHhr30>4x+IJZrZbt$qb6feF&Z%g
+z+`ifj!-_^AYJ^#b45)mur*b2WK#mBPLsI60;7XJ+XaEKgKm4?r2&zlGkgRvfrP${}
+z49{m#j(USku5!s7bk1^Q(r|z_8jf+$h&abUg-Eq#k~1Z3b_JPr%bbh1ZUd!D+C{8_
+zOe@8zQVE1k03I4<2GZXWrXU;*76XEIz@%RR#KEXCWVqzAEtO^>X(ZGOf!DCLrP9G$
+zDrqHP1{2e3;omJ=Ds?z_KB<(H7wW?s=z{vBGE|a|fe7U_Qz~g;sbsJv7Hf-eTQj;S
+zC6fhZJugNKUk*Ld*I0I>nc!U~9BH9Tu7H-8Fqte`lvENl8e%eCyp>)pldEg#HCD8W
+zArqQ`dKTfC)g^P0qmirE*3%|Y5F%sgc`LX&0c?-NpQ(q(uyFlOM|a7U6Lp5y8XabC
+zLXIvc=$)pCk!&y^lWVFRuWVQ%e@{L8M}rp*GH;@ps--dIwAe)tLqV5BCYpIJLYOw=
+z9oY}2te>ctGT|l)MVi-zWx_Xf$$X*@!GMcBr;kDm;XJiGd0Zs`h+&UqicFTcqya!&
+z4!7fo4+D#>N-e!MsSIyrU*REhEtC0UsY@1M;uT=KtSSYexv5d+3~pzbHY}nC*-)Jf
+z3pXNruHmtOxPWHZb|Gv!;?=J}G>}lDft2BUv`D;Rk$3_0qOwOXhet10OcX{QTq4P|
+zIpL6*KuTu8S{hFV6S8maaD7b*LdLoKyX0!@l>!;V!dAFcmx%5_s=&e#R=<la+0HX<
+z+dl3#BXk8^WI6Wba9rn-CTKZ#L?$b$Mn{f>SRfd#XZx10U2SYT&e%oPwS&cWv&epC
+z9c9W1)_SUzUY}G(s$Fu;mdesdvT(drVbLIqh8g6H);H0WGPz!0(Co{_QL!Lb1ad)K
+zwxyDdSf^tATmo-HIg23=)yrfh&mt+LM^it{P$72jIGnITZ2#_4N+Z29x#Ofh>_m4!
+z7G#D~N@V{Io~m~v%dR~|Z`BjL5HbGB+6+`an5=ELOBR=t<nGL=M!FgxulCAcBfZh9
+z3vIkEBpAIxCO2>!*3veE*9Bn*hz-%l>Vn1V!cnD(-XxR6hbMcLVMn<#_|tAgZNL_&
+z4XvmRt7NhY=c$$*{%9-niM9rM#|QO6Kb%5+*x?_aj^bqG>^OSLB~dsUYQ;^_-SD;D
+z<|$O_+Xe4i!24#I+&qUSlP5-IyCeqp9!Z`Ut;S)fi-lWReT;Q)XT<{BA7Q6<an4Kj
+z!AvY*aHklRNs{e9vGcg;k|nU)FZ7}F>#eDXV<Nf5cf%#8YDVFPtIJ6!2)tX6guv|9
+zb#Rp1%H<wqtrKB#tv7a?DD=0xWGS!NcerHPa`@t%E{PwF%B0;T%i)t(B1BUMXeSOT
+z2Ngp<21;b)Ir*`ST-xeqWV3=?Rua|G2=JpJPbt?yi7z4D!udulm#pxzZUR{sZg?E%
+zBofKUnONinoK%#+G1?J?H<@$tx;Af4evoz~g9HgVLaIxWB1ZiroG1lZ3@60vkpjE*
+zgdPnLokuouf51bhgK0eRtn{i*r}uV)NJCvNNkF%Hq_6H5wfRg@25CB}px~lBlq6$=
+z_XZ(LQkfPa9HVJ|G`LC<fpz0b{kTlh9_LkpbB{|}!Fd7l)tWhUZPFk$jj|*$tr4QM
+zi79Jca?|EY=Oo6A2z7YE$AQwz#EO@k7HW$kUcB%cf)LcMMlQAvDKOs6<wUg(F|<yU
+zULM#urD2C8(9YJ<40H)<O)j}*OQn=ZhKa!&JkUa(u0)Q6cp1MuDS;XX=3fWSJQb~X
+z$!aKY4a}ZBK>Nnb-m8R$P=`%jYc`kir&UXPlh*Oo6DqGu9HSWa4WpNM-tK)tF^*w5
+zH)g4%%`3U&*3FgrC<ob?L;IloB-NMzX=T#Kv?jhL=aSp7^<q;d`9}Jnmlbk6D}2nM
+zAC<{R5$H$)IvmH0EwX4XG(3;qt<9htv?#qxTS$vqjP}c<ze-Oqcwo#B$JW~?nr9km
+zLD@?m!tvAG1`a^#4!8w$EY#A6l+#W00htu3?(lUS??_A(v^yu7L~o=I1L=o7q!H*3
+zhuAhcaGEa}@OZU*yzVOR%TIkQ0$ZgfI;6Uh4r1>|#_iqV%^$3#kNA6UIB#humew@V
+zP1t&9%*gzUV2E$O@ig5glZ_(6x;$>1YB5n;)I{%<$=#e?B*2zBhBydyLk~lo&3OF|
+z;4Rol9|h}2&td&2XT9Y#-7J&MU@cA%Tf`o?)8S}+tZV^+eo31`KcOw7AJ?v?TeUd7
+zM<(}Fq38p8U;iHLG^vr6p#Njz^k3s~E7j7+eEqkcyKXJkO>U$+AmOfaB;3U%+%A;g
+zraQdSm{vf@xn0Pa@i_0O#X4<~OzthG#6{k$k5@@dIK{e&Itew>-PmFGIXmp;JM277
+z?~}=W90Pt>-YIym2X9FxpWvbbTOMv%aGBCb?}vW)tRM5OUQdeqYw6?4X_-7wK8-zC
+zOLK}gg)L>u1e4}v@{mhz=Q;Obm)yypkHBU4bI2u~{Q0O$y7}`lm-O)GE|;w3PvrM?
+z{P{RU;LklS=|kjPhsb%Nk$&2XoIN~po^$AvGI_FWH$QUrgi7=1UPR8P5IN5va$K3X
+ziz0MSD5b5SPixoHPil+kQ!;s~k?t`TqM72dg5)+=CPo!QWNk!n%-|o9FoO8X`Q*6C
+z{5+KB)0CKkIatjzo2eLp^Xaj92sqA{kHmNecxG$_4jeV403T&BO9azLQFDLhCoTVY
+z`>C<{eBuFmP)S%D=)t5#^hik>^r%FvB()x+2Q7TZ;Qa2A{w<ZML<F*@Ql9Mm-&Vf=
+z-bOkcS%`)&Ll%vAl8JNZ@O=6#K4$oV)|4Zd`fLN;6JbjeeA#nlco7zW7GZG&VetaO
+zVn4!SpG@|R$yw!i=^h6zoXdHAD!_-PM#B<7#TgU%adIFU=C=aK)#06{e!kZG$G8C^
+z1)5u%>GN#Vip`<VE6Es{<dP!Jb_wtbMHD?H!bGvS=-MJK@AF&e0hUlAvCZ^AV$^EA
+zlpaX7l1W%vjcS;(A{@gA(ZK*^7tlq@$vss9zZB1qt%9Gh=K%n3u^3+zBf8=N4=Mp0
+zaNuKQ;0HMH3KvNL?};RUKj{0Bwun2(3yt&;%y8%&Gib|r&^#fNL*ljw-vRUKi#Pz>
+zwYidwLfR?#_zW=ZhF}vtERz>&>1QHZg30Jg1Z8sAC4&<sGEG0jKki4hWr3i!N>LQK
+zTIPS^_TtDGuH5>*Uq(1!pRT2Q5V&LGd=TBAamj|bO#a>_8xei2NRT7IPgihIc?qYa
+zI@HS{)JuISs)%lQg;Uopt=SPh5v`dCBBnJbK$v=~)|?VVm)4vYLxn;560e!1WC3T9
+z?Se5sf9S`Dphrn-GjPY$+Ew7jRklN>m%O9KCUMkw*(G;FvYQ;4ywXUIC5@B#@Z(1f
+zB^)*IF=V8ys4;|tm-qR%8Q;raI249cZoxU?SGDx0qRs_=IA^~qlcN9^x#ramAXKzf
+z;c!^J%EJ)%Sd}LI9QHZ}^qT0)GWo1aK8F2oMqc_HWc$2J?!jvkuU~LU>7_~uz!=Cm
+z&AMK}Kg@N&XByTq`kEEO0p=<K^qh)>&XKA}=^Q7#wYp?0)~4WV<+X~pHpLGeU&NJx
+zzcy8o=WwSgn9dQ!+JZ~A;d=?^PcrqluR+u8cq7x{{?ld~`bg=5N-_gylj-UraS~I2
+zEN)SeECj&ZIlqYA`9bM5Xs`_L|KO4xQ0i7#|4U`-e;L;A)UKM7_`e%pFB@MMq6#l4
+zXw4--Y}cBH1hGqN9u|JFPir0##4B3!aY4MUHJ=p3J6iLoAl}uQ&ww!X_q1lB3+e)0
+zCpDxR%HUSzHs5!)@7nju>+ih#-Ua-|;LA+A9kARh{O7n!J`UaPfWf}PO~XC=t5|yt
+zOmp&o_2>V$O8W8RkZ?r1)AMaEA0+!~IY-PiTymd~?{$~#gnaFg@5Fri2IT(4N|Vf#
+z$r}yy_41`!g@P-lH)ZlQm)wuZ9dOV$Yw6c5e8ih$R{eS{{f4qM#Sbo)fjo0UCf`^<
+z-!c{(kyr!$W~7OJOD5l(Prnn9$+xPQI9<iWM>8(hc^ZF!r}0bax5GSx<N5?Op9PV>
+z@g4Ud!s-OR<4`5|NnL3P8b(W?!s3^fTmW3Bo6zsuE_q0NEQU#lGf{L?Z>bO9+$PSG
+zh%TtXWb&Ol`WEuu!>Fz!R<)(GL`$T?Xi*?~%<xowYd-y&A+A0v{GRW+<Pj*}38YTW
+zr*A8sH8;@j@#K;;MoQB23a&e3@;$Z`Q6!VM8|Zg=!aXIEcU&@rwOv??kIC<2wu}ki
+zUqIhc7Asbyf&Rd1qCb?$59ZS!TQd0}Y8<n~oq`b-C#Od}Y<`psk9-InTvt5?bWY-i
+z28akH#A)tFF4^T{F_|yn|C4~^auT-taUFffa>;IfdjV0Z`5_;2o|MTyy5w=l*^Nm*
+z5f@zIt_XKKd$<9BKJs3G@$~kDsJQ`L{3^yy9VU9REJRRIS^|n^ke|B51-~@-{j5rI
+zT=EoZ@lSBaCCTLHF8L(JdUTom0{^W70e&fyQI|Z;I|0-$7tqr%pb3DK7R&G_oUW&%
+za7&KwyDoVKbJu{uuNKgEfuzDG{aPmf<dRSE5penS0{R=cV0q*>SohDagu%5C;kT?t
+zS*eo?W%4gxA6Wg4r*d?gWR^_+)g^l|cOB&aJ#KB`8tD8tmkgtGJ(I~F__cQgUzL#w
+zjLwtE8J9eZp)5B3BfNkwcts|Ea>;Y(?FE<j#<;xil6~mx!_+@F()V$SeqV8P#^cG+
+zaBE{2iX^ob``hsUYEry6kEgr?q=_~Wtr88N#e!Dx#B4$1haaN9%J0KN;`9`>@_Y+)
+zh2MYaIC{=F+6G;of7v*?&Y#0&z<==xKAdhqE6?ZsWt#c)5<FYb_`aOJb{vggu?YEj
+z{|ukzJeQ)C=X3qabbK6r^*DMtXudD!GhW}7en01VBO3qX^et$dC#P4Bqf_JP4Ct~h
+zoUUluz-=LQqj9X)qVe(H`7|EVZ_zr?xXf>&@!!qxedeQ;<*Eh!5i~xh{N(fmzmM|_
+zTszRm_d0^cW$Z)aeEy6k{^T#b|9KF-XngH^XndXQ_g@E^&ws*yN`C)h|2>Z<UsvwW
+z`u%^zGr(zo{(ArY4|sCF3;6x(K=bv#N8@sfeOF|PT;>PS_#c<MX8YQT!AkM#n869&
+zZ&J`ZZ9Csj84U2>2@Fo~{`-4S>F*fid_N*a<-rN~5B6d<eNLA*m3RG};4FUnGFXx0
+za%$-55QyMKny{T?BVC^^a(mQyJRyvZA98eN@spCCbVm_CY$<S2<Uy^sV`FC;KQ_qs
+IujB0h3;%F>*Z=?k
+
+literal 9652
+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
+QW_wo_|8Fl8w+Qk74ITU|XaE2J
+
+diff --git a/erts/preloaded/src/erl_prim_loader.erl b/erts/preloaded/src/erl_prim_loader.erl
+index 0c472fa9e3..6db7dfde13 100644
+--- a/erts/preloaded/src/erl_prim_loader.erl
++++ b/erts/preloaded/src/erl_prim_loader.erl
+@@ -210,7 +210,7 @@ start_efile(Parent) ->
+                     data = noport,
+                     timeout = ?EFILE_IDLE_TIMEOUT,
+                     prim_state = PS},
+-    set_loader_config({efile, PS#prim_state.primary_archive}),
++    set_loader_config({efile, PS#prim_state.primary_archive, undefined}),
+     loop(State, Parent, []).
+ 
+ init_ack(Pid) ->
+@@ -262,7 +262,22 @@ information about archive files, see `m:code`.
+ get_file(File) when is_atom(File) ->
+     get_file(atom_to_list(File));
+ get_file(File) ->
+-    check_file_result(get_file, File, request({get_file,File})).
++    Res = case get_loader_config() of
++              {efile, _, _} ->
++                  case is_basename(File) of
++                      true ->
++                          %% Searched for in the path
++                          request({get_file,File});
++                      false ->
++                          case client_or_request(read_file, File) of
++                              {ok,Bin} -> {ok,Bin,File};
++                              Error -> Error
++                          end
++                  end;
++              inet ->
++                  request({get_file,File})
++          end,
++    check_file_result(get_file, File, Res).
+ 
+ -doc """
+ Lists all the files in a directory.
+@@ -344,7 +359,7 @@ read_link_info(File) ->
+ get_cwd() ->
+     Res =
+         case get_loader_config() of
+-            {efile, _} -> prim_file:get_cwd();
++            {efile, _, _} -> prim_file:get_cwd();
+             inet -> request({get_cwd,[]})
+         end,
+     check_file_result(get_cwd, [], Res).
+@@ -354,22 +369,25 @@ get_cwd() ->
+ get_cwd(Drive) ->
+     Res =
+         case get_loader_config() of
+-            {efile, _} -> prim_file:get_cwd(Drive);
++            {efile, _, _} -> prim_file:get_cwd(Drive);
+             inet -> request({get_cwd,[Drive]})
+         end,
+     check_file_result(get_cwd, Drive, Res).
+ 
++%% ArchiveBin `undefined' reads the archive from File itself, whose zip
++%% offsets must then be relative to the start of File.
+ -doc false.
+--spec set_primary_archive(File :: string() | 'undefined', 
++-spec set_primary_archive(File :: string() | 'undefined',
+ 			  ArchiveBin :: binary() | 'undefined',
+ 			  FileInfo :: #file_info{} | 'undefined',
+-			  ParserFun :: fun())
++			  ParserFun :: fun() | 'undefined')
+ 			 -> {ok, [string()]} | {error,_}.
+ 
+ set_primary_archive(undefined, undefined, undefined, ParserFun) ->
+     request({set_primary_archive, undefined, undefined, undefined, ParserFun});
+ set_primary_archive(File, ArchiveBin, FileInfo, ParserFun)
+-  when is_list(File), is_binary(ArchiveBin), is_record(FileInfo, file_info) ->
++  when is_list(File), is_binary(ArchiveBin) orelse ArchiveBin =:= undefined,
++       is_record(FileInfo, file_info) ->
+     request({set_primary_archive, File, ArchiveBin, FileInfo, ParserFun}).
+ 
+ %% NOTE: Does not close the primary archive. Only closes all
+@@ -412,15 +430,87 @@ request(Req) ->
+ 
+ client_or_request(Fun, File) ->
+     case get_loader_config() of
+-        {efile, PrimaryArchive} ->
++        {efile, PrimaryArchive, ClientIndex} ->
+             case name_split(PrimaryArchive, File) of
+-                {file, SplitFile} -> prim_file:Fun(SplitFile);
+-                {archive, _, _} = Archive -> request({Fun,Archive})
++                {file, SplitFile} ->
++                    prim_file:Fun(SplitFile);
++                {archive, _, FileInArchive} = Archive ->
++                    case client_archive(Fun, PrimaryArchive, FileInArchive,
++                                        ClientIndex) of
++                        request -> request({Fun,Archive});
++                        Res -> Res
++                    end
+             end;
+         inet ->
+             request({Fun,File})
+     end.
+ 
++%% Reads from the primary archive in the calling process, as the round trip
++%% to the loader process costs more than the read.
++client_archive(_Fun, _Archive, _FileInArchive, undefined) ->
++    request;
++client_archive(_Fun, _Archive, [], _ClientIndex) ->
++    request; % the archive itself
++client_archive(Fun, Archive, FileInArchive, {Files, Dirs, Mtime}) ->
++    case prim_file:read_file_info(Archive) of
++        {ok, #file_info{mtime = Mtime}} ->
++            Components = path_split(FileInArchive),
++            case Fun of
++                read_file ->
++                    case Files of
++                        #{Components := {_FI, undefined}} ->
++                            {ok, <<>>}; % a directory
++                        #{Components := {_FI, Location}} ->
++                            client_read(Archive, Mtime, FileInArchive,
++                                        Location);
++                        #{} ->
++                            {error, enoent}
++                    end;
++                list_dir ->
++                    case Dirs of
++                        #{Components := Names} -> {ok, Names};
++                        #{} -> {error, enotdir}
++                    end;
++                _ when Fun =:= read_file_info; Fun =:= read_link_info ->
++                    DirComponents = ["" | Components],
++                    case Files of
++                        #{Components := {FI, _}} -> {ok, FI};
++                        #{DirComponents := {FI, _}} -> {ok, FI};
++                        #{} -> {error, enoent}
++                    end
++            end;
++        _ ->
++            request
++    end.
++
++client_read(Archive, Mtime, FileInArchive, {Offset, Size, _CompMethod}) ->
++    Key = {?MODULE, Archive},
++    Fd = case get(Key) of
++             {Mtime, Fd0} ->
++                 Fd0;
++             Old ->
++                 case Old of
++                     {_OldMtime, OldFd} -> prim_file:close(OldFd);
++                     undefined -> ok
++                 end,
++                 {ok, Fd0} = prim_file:open(Archive, [read, binary, raw]),
++                 put(Key, {Mtime, Fd0}),
++                 Fd0
++         end,
++    case prim_file:pread(Fd, Offset, Size) of
++        {ok, Bin} ->
++            try
++                {ok, prim_zip:read_z_file(FileInArchive, Bin)}
++            catch
++                throw:Reason ->
++                    {error, Reason}
++            end;
++        eof ->
++            {error, einval};
++        {error, _} = Error ->
++            Error
++    end.
++
+ check_file_result(_, _, {error,enoent}) ->
+     error;
+ check_file_result(_, _, {error,enotdir}) ->
+@@ -630,9 +720,17 @@ efile_set_primary_archive(#state{prim_state = PS} = State, File,
+ 			  ArchiveBin, FileInfo, ParserFun) ->
+     {Res, PS2} = prim_set_primary_archive(PS, File, ArchiveBin,
+ 					  FileInfo, ParserFun),
+-    set_loader_config({efile, PS2#prim_state.primary_archive}),
++    publish_primary_archive(PS2#prim_state.primary_archive),
+     {Res,State#state{prim_state = PS2}}.
+ 
++publish_primary_archive(undefined) ->
++    set_loader_config({efile, undefined, undefined});
++publish_primary_archive(ArchiveFile) ->
++    {primary, _PrimZip, {_Files, Dirs, ClientFiles}, FI, _ParserFun} =
++        get(ArchiveFile),
++    set_loader_config({efile, ArchiveFile,
++                       {ClientFiles, Dirs, FI#file_info.mtime}}).
++
+ efile_list_dir(#state{prim_state = PS} = State, Dir) ->
+     {Res, PS2} = prim_list_dir(PS, Dir),
+     {Res, State#state{prim_state = PS2}}.
+@@ -1047,7 +1145,7 @@ prim_purge_cache() ->
+ 
+ do_prim_purge_cache([{Key,Val}|T]) ->
+     case Val of
+-	{Cache,_FI} ->
++	{{ok, _, _} = Cache,_FI} ->
+ 	    catch clear_cache(Key, Cache);
+ 	_ ->
+ 	    ok
+@@ -1064,7 +1162,7 @@ prim_set_primary_archive(PS, undefined, undefined, undefined, _ParserFun) ->
+             debug(PS, {return, Res}),
+             {Res, PS};
+         ArchiveFile ->
+-            {primary, PrimZip, _FI, _ParserFun2} = erase(ArchiveFile),
++            {primary, PrimZip, _Index, _FI, _ParserFun2} = erase(ArchiveFile),
+             ok = prim_zip:close(PrimZip),
+             PS2 = PS#prim_state{primary_archive = undefined},
+             Res = {ok, []},
+@@ -1074,17 +1172,23 @@ prim_set_primary_archive(PS, undefined, undefined, undefined, _ParserFun) ->
+ 
+ prim_set_primary_archive(PS, ArchiveFile0, ArchiveBin,
+ 			 #file_info{} = FileInfo, ParserFun)
+-  when is_list(ArchiveFile0), is_binary(ArchiveBin) ->
++  when is_list(ArchiveFile0),
++       is_binary(ArchiveBin) orelse ArchiveBin =:= undefined ->
+     %% Try the archive file
+-    debug(PS, {set_primary_archive, ArchiveFile0, byte_size(ArchiveBin)}),
++    debug(PS, {set_primary_archive, ArchiveFile0,
++               case ArchiveBin of
++                   undefined -> file;
++                   _ -> byte_size(ArchiveBin)
++               end}),
+     ArchiveFile = real_path(absname(ArchiveFile0)),
+     {Res3, PS3} =
+         case PS#prim_state.primary_archive of
+             undefined ->
+                 case load_prim_archive(ArchiveFile, ArchiveBin, FileInfo) of
+-                    {ok, PrimZip, FI, Ebins} ->
++                    {ok, PrimZip, Index, FI, Ebins} ->
+                         debug(PS, {set_primary_archive, Ebins}),
+-                        put(ArchiveFile, {primary, PrimZip, FI, ParserFun}),
++                        put(ArchiveFile,
++                            {primary, PrimZip, Index, FI, ParserFun}),
+                         {{ok, Ebins},
+                          PS#prim_state{primary_archive = ArchiveFile}};
+                     Error ->
+@@ -1093,7 +1197,8 @@ prim_set_primary_archive(PS, ArchiveFile0, ArchiveBin,
+                 end;
+             OldArchiveFile ->
+                 debug(PS, {set_primary_archive, clean}),
+-                {primary, PrimZip, _FI, _ParserFun} = erase(OldArchiveFile),
++                {primary, PrimZip, _Index, _FI, _ParserFun} =
++                    erase(OldArchiveFile),
+                 ok = prim_zip:close(PrimZip),
+                 PS2 = PS#prim_state{primary_archive = undefined},
+                 prim_set_primary_archive(PS2, ArchiveFile, ArchiveBin,
+@@ -1115,18 +1220,18 @@ prim_read_file(PS, File) ->
+                 debug(PS, {archive_read_file, ArchiveFile, FileInArchive}),
+                 FileComponents = path_split(FileInArchive),
+                 Fun =
+-                    fun({Components, _GetInfo, GetBin}, Acc) ->
+-                            if
+-                                Components =:= FileComponents ->
+-                                    {false, {ok, GetBin()}};
+-                                true ->
+-                                    {true, Acc}
++                    fun({Files, _Dirs, _ClientFiles}) ->
++                            case Files of
++                                #{FileComponents := {_GetInfo, GetBin}} ->
++                                    {ok, GetBin()};
++                                #{} ->
++                                    {error, enoent}
+                             end
+                     end,
+-                apply_archive(PS, Fun, {error, enoent}, ArchiveFile)
++                with_archive(PS, ArchiveFile, Fun)
+         end,
+     debug(PS, {return, Res2}),
+-    {Res2, PS2}.    
++    {Res2, PS2}.
+ 
+ -doc false.
+ -spec prim_list_dir(prim_state(), file:filename() | archive()) ->
+@@ -1143,41 +1248,15 @@ prim_list_dir(PS, Dir) ->
+                 debug(PS, {archive_list_dir, ArchiveFile, FileInArchive}),
+                 DirComponents = path_split(FileInArchive),
+                 Fun =
+-                    fun({Components, _GetInfo, _GetBin}, {Status, Names} = Acc) ->
+-                            case Components of
+-                                [RevName | DC] when DC =:= DirComponents ->
+-                                    case RevName of
+-                                        "" ->
+-                                            %% The listed directory
+-                                            {true, {ok, Names}};
+-                                        _ ->
+-                                            %% Plain file
+-                                            Name = reverse(RevName),
+-                                            {true, {Status, [Name | Names]}}
+-                                    end;
+-                                ["", RevName | DC] when DC =:= DirComponents ->
+-                                    %% Directory
+-                                    Name = reverse(RevName),
+-                                    {true, {Status, [Name | Names]}};
+-                                [RevName] when DirComponents =:= [""] ->
+-                                    %% File in top directory
+-                                    Name = reverse(RevName),
+-                                    {true, {ok, [Name | Names]}};
+-                                ["", RevName] when DirComponents =:= [""] ->
+-                                    %% Directory in top directory
+-                                    Name = reverse(RevName),
+-                                    {true, {ok, [Name | Names]}};
+-                                _ ->
+-                                    %% No match
+-                                    {true, Acc}
++                    fun({_Files, Dirs, _ClientFiles}) ->
++                            case Dirs of
++                                #{DirComponents := Names} ->
++                                    {ok, Names};
++                                #{} ->
++                                    {error, enotdir}
+                             end
+                     end,
+-                {{Status, Names}, PS2} =
+-                    apply_archive(PS, Fun, {error, []}, ArchiveFile),
+-                case Status of
+-                    ok    -> {{ok, Names}, PS2};
+-                    error -> {{error, enotdir}, PS2}
+-                end
++                with_archive(PS, ArchiveFile, Fun)
+         end,
+     debug(PS, {return, Res2}),
+     {Res2, PS3}.
+@@ -1207,21 +1286,21 @@ prim_read_file_info(PS, File, FollowLinks) ->
+             {archive, ArchiveFile, FileInArchive} ->
+                 debug(PS, {archive_read_file_info, File}),
+                 FileComponents = path_split(FileInArchive),
++                DirComponents = ["" | FileComponents],
+                 Fun =
+-                    fun({Components, GetInfo, _GetBin}, Acc)  ->
+-			    case Components of
+-				["" | F] when F =:= FileComponents ->
+-                                    %% Directory
+-                                    {false, {ok, GetInfo()}};
+-                                F when F =:= FileComponents ->
++                    fun({Files, _Dirs, _ClientFiles}) ->
++                            case Files of
++                                #{FileComponents := {GetInfo, _GetBin}} ->
+                                     %% Plain file
+-                                    {false, {ok, GetInfo()}};
+-                                _ ->
+-                                    %% No match
+-                                    {true, Acc}
++                                    {ok, GetInfo()};
++                                #{DirComponents := {GetInfo, _GetBin}} ->
++                                    %% Directory
++                                    {ok, GetInfo()};
++                                #{} ->
++                                    {error, enoent}
+                             end
+                     end,
+-                apply_archive(PS, Fun, {error, enoent}, ArchiveFile)
++                with_archive(PS, ArchiveFile, Fun)
+         end,
+     debug(PS2, {return, Res2}),
+     {Res2, PS2}.
+@@ -1242,77 +1321,63 @@ prim_get_cwd(PS, [Drive]) ->
+ 
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ 
+-apply_archive(PS, Fun, Acc, Archive) ->
++with_archive(PS, Archive, Fun) ->
+     case get(Archive) of
+         undefined ->
+-	    case open_archive(Archive, Acc, Fun) of
+-		{ok, PrimZip, {Acc2, FI, _}} ->
++	    case open_archive(Archive) of
++		{ok, PrimZip, Index, FI} ->
+ 		    debug(PS, {cache, ok}),
+-		    put(Archive, {{ok, PrimZip}, FI}),
+-		    {Acc2, PS};
++		    put(Archive, {{ok, PrimZip, Index}, FI}),
++		    {Fun(Index), PS};
+ 		Error ->
+ 		    debug(PS, {cache, Error}),
+-		    %% put(Archive, {Error, FI}),
+ 		    {Error, PS}
+ 	    end;
+-        {primary, PrimZip, FI, ParserFun} ->
++        {primary, PrimZip, Index, FI, ParserFun} ->
+ 	    case prim_file:read_file_info(Archive) of
+-                {ok, FI2} 
++                {ok, FI2}
+ 		  when FI#file_info.mtime =:= FI2#file_info.mtime ->
+-		    case foldl_archive(PrimZip, Acc, Fun) of
+-			{ok, _PrimZip2, Acc2} ->
+-			    {Acc2, PS};
+-			Error ->
+-			    debug(PS, {primary, Error}),
+-			    {Error, PS}
+-		    end;
++		    {Fun(Index), PS};
+ 		{ok, FI2} ->
+-		    ok = clear_cache(Archive, {ok, PrimZip}),
++		    ok = clear_cache(Archive, {ok, PrimZip, Index}),
+ 		    case load_prim_archive(Archive, FI2, ParserFun) of
+-			{ok, PrimZip2, FI3, _Ebins} ->
++			{ok, PrimZip2, Index2, FI3, _Ebins} ->
+ 			    debug(PS, {cache, {update, Archive}}),
+-			    put(Archive, {primary, PrimZip2, FI3, ParserFun});
++			    put(Archive, {primary, PrimZip2, Index2, FI3,
++                                          ParserFun}),
++                            publish_primary_archive(Archive);
+ 			Error2 ->
+-			    debug(PS, {cache, {clear, Error2}})
++			    debug(PS, {cache, {clear, Error2}}),
++                            publish_primary_archive(undefined)
+ 		    end,
+-		    apply_archive(PS, Fun, Acc, Archive);
++		    with_archive(PS, Archive, Fun);
+ 		Error ->
+ 		    debug(PS, {cache, {clear, Error}}),
+-		    ok = clear_cache(Archive, {ok, PrimZip}),
+-		    apply_archive(PS, Fun, Acc, Archive)
++		    ok = clear_cache(Archive, {ok, PrimZip, Index}),
++		    with_archive(PS, Archive, Fun)
+ 	    end;
+-        {Cache, FI} ->
++        {{ok, _PrimZip, Index} = Cache, FI} ->
+             case prim_file:read_file_info(Archive) of
+-                {ok, FI2} 
++                {ok, FI2}
+ 		  when FI#file_info.mtime =:= FI2#file_info.mtime ->
+-                    case Cache of
+-                        {ok, PrimZip} ->
+-                            case foldl_archive(PrimZip, Acc, Fun) of
+-                                {ok, _PrimZip2, Acc2} ->
+-                                    {Acc2, PS};
+-                                Error ->
+-                                    debug(PS, {cache, {clear, Error}}),
+-                                    ok = clear_cache(Archive, Cache),
+-                                    debug(PS, {cache, Error}),
+-				    erase(Archive),
+-                                    %% put(Archive, {Error, FI}),
+-                                    {Error, PS}
+-                            end;
+-                        Error ->
+-                            debug(PS, {cache, Error}),
+-                            {Error, PS}
+-                    end;
++                    {Fun(Index), PS};
+                 Error ->
+                     debug(PS, {cache, {clear, Error}}),
+                     ok = clear_cache(Archive, Cache),
+-                    apply_archive(PS, Fun, Acc, Archive)
++                    with_archive(PS, Archive, Fun)
+             end
+     end.
+ 
+-open_archive(Archive, Acc, Fun) ->
++open_archive(Archive) ->
+     case prim_file:read_file_info(Archive) of
+ 	{ok, FileInfo} ->
+-	    open_archive(Archive, FileInfo, Acc, Fun);
++            Fun = fun(_, Acc) -> {true, Acc} end,
++	    case open_archive(Archive, FileInfo, [], Fun) of
++                {ok, PrimZip, Index, {[], FI}} ->
++                    {ok, PrimZip, Index, FI};
++                Error ->
++                    Error
++            end;
+ 	{error, Reason} ->
+ 	    {error, Reason}
+     end.
+@@ -1325,10 +1390,11 @@ open_archive(Archive, Acc, Fun) ->
+ %% present. To ensure consistency, a directory element is added if it
+ %% does not already exist (ensure_virtual_dirs/6). NOTE that there will
+ %% be no such directory element for the top directory of the archive.
++%%
+ open_archive(Archive, FileInfo, Acc, Fun) ->
+     FakeFI = FileInfo#file_info{type = directory},
+     Wrapper =
+-	fun({N, GI, GB}, {A, I, Dirs}) ->
++	fun({N, GI, GB, _Location}, {A, I, Dirs}) ->
+ 		Components = path_split(N),
+ 		Dirs2 =
+ 		    case Components of
+@@ -1345,7 +1411,46 @@ open_archive(Archive, FileInfo, Acc, Fun) ->
+ 		{_Continue, A3} = Fun({Components, GI, GB}, A2),
+ 		{true, Includes, {A3, I, Dirs3}}
+ 	end,
+-    prim_zip:open(Wrapper, {Acc, FakeFI, []}, Archive).
++    case prim_zip:open(Wrapper, {Acc, FakeFI, []}, Archive) of
++        {ok, PrimZip, {Acc2, FI, _Dirs}} ->
++            {ok, PrimZip, archive_index(PrimZip), {Acc2, FI}};
++        Error ->
++            Error
++    end.
++
++%% {#{Components => {GetInfo, GetBin}}, #{DirComponents => [Name]},
++%%  #{Components => {FileInfo, Location}}}
++archive_index(PrimZip) ->
++    Fun = fun({Components, GI, GB, Location}, {Files, Dirs, ClientFiles}) ->
++                  {true, {Files#{Components => {GI, GB}},
++                          index_dirs(Components, Dirs),
++                          ClientFiles#{Components => {GI(), Location}}}}
++          end,
++    {ok, _PrimZip, Index} = foldl_archive(PrimZip, {#{}, #{}, #{}}, Fun),
++    Index.
++
++index_dirs(["", RevName | Dir], Dirs) ->
++    Dirs2 = index_name(Dir, RevName, Dirs),
++    Key = [RevName | Dir],
++    case Dirs2 of
++        #{Key := _} -> Dirs2;
++        #{} -> Dirs2#{Key => []}
++    end;
++index_dirs([RevName | Dir], Dirs) ->
++    index_name(Dir, RevName, Dirs).
++
++index_name(Dir0, RevName, Dirs) ->
++    %% path_split/1 returns [""] for the top directory
++    Dir = case Dir0 of
++              [] -> [""];
++              _ -> Dir0
++          end,
++    Name = reverse(RevName),
++    Names = case Dirs of
++                #{Dir := Ns} -> Ns;
++                #{} -> []
++            end,
++    Dirs#{Dir => [Name | Names]}.
+ 
+ ensure_virtual_dirs(Components, Fun, FakeFI, Includes, Dirs, Acc) ->
+     case Components of
+@@ -1377,24 +1482,19 @@ ensure_virtual_dirs(Components, Fun, FakeFI, Includes, Dirs, Acc) ->
+ 
+ foldl_archive(PrimZip, Acc, Fun) ->
+     Wrapper =
+-        fun({Components, GI, GB}, A) ->
++        fun({Components, GI, GB, Location}, A) ->
+                 %% Allow partial iteration at foldl
+-                {Continue, A2} = Fun({Components, GI, GB}, A),
++                {Continue, A2} = Fun({Components, GI, GB, Location}, A),
+                 {Continue, true, A2}
+-        end,                        
++        end,
+     prim_zip:foldl(Wrapper, Acc, PrimZip).
+ 
+ cache_new(PS) ->
+     PS.
+ 
+-clear_cache(Archive, Cache) ->
++clear_cache(Archive, {ok, PrimZip, _Index}) ->
+     erase(Archive),
+-    case Cache of
+-        {ok, PrimZip} ->
+-            prim_zip:close(PrimZip);
+-        {error, _} ->
+-            ok
+-    end.
++    prim_zip:close(PrimZip).
+ 
+ %%% --------------------------------------------------------
+ %%% Misc. functions.
+@@ -1516,15 +1616,40 @@ name_split(undefined, File) ->
+ name_split(ArchiveFile, File0) ->
+     %% Look first in primary archive
+     File = absname(File0),
+-    case string_match(real_path(File), ArchiveFile) of
+-        no_match ->
+-            %% Archive or plain file
+-            name_split(undefined, File);
++    case string_match(File, ArchiveFile) of
+         {match, FileInArchive} ->
+-            %% Primary archive
+-	    {archive, ArchiveFile, FileInArchive}
++            %% No symbolic links to resolve (one system call per component)
++            {archive, ArchiveFile, normalize_path(FileInArchive)};
++        no_match ->
++            case string_match(real_path(File), ArchiveFile) of
++                no_match ->
++                    %% Archive or plain file
++                    name_split(undefined, File);
++                {match, FileInArchive} ->
++                    %% Primary archive
++                    {archive, ArchiveFile, FileInArchive}
++            end
+     end.
+ 
++normalize_path(Path) ->
++    normalize_path(Path, [], []).
++
++normalize_path([$/ | T], Comp, Acc) ->
++    normalize_path(T, [], add_component(reverse(Comp), Acc));
++normalize_path([H | T], Comp, Acc) ->
++    normalize_path(T, [H | Comp], Acc);
++normalize_path([], Comp, Acc) ->
++    join_components(reverse(add_component(reverse(Comp), Acc))).
++
++add_component(".", Acc) -> Acc;
++add_component("..", [_ | Acc]) -> Acc;
++add_component("..", []) -> [];
++add_component(Comp, Acc) -> [Comp | Acc].
++
++join_components([]) -> [];
++join_components([Comp]) -> Comp;
++join_components([Comp | Comps]) -> Comp ++ "/" ++ join_components(Comps).
++
+ string_match([Char | File], [Char | Archive]) ->
+     string_match(File, Archive);
+ string_match([] = File, []) ->
+@@ -1741,14 +1866,19 @@ load_prim_archive(ArchiveFile, ArchiveBin, #file_info{}=FileInfo) ->
+ 		  end
+ 	  end,
+     Ebins0 = [ArchiveFile],
+-    case open_archive({ArchiveFile, ArchiveBin}, FileInfo,
+-		      Ebins0, Fun) of
+-	{ok, PrimZip, {RevEbins, FI, _}} ->
++    Archive = case ArchiveBin of
++                  undefined -> ArchiveFile; % read from the file itself
++                  _ -> {ArchiveFile, ArchiveBin}
++              end,
++    case open_archive(Archive, FileInfo, Ebins0, Fun) of
++	{ok, PrimZip, Index, {RevEbins, FI}} ->
+ 	    Ebins = reverse(RevEbins),
+-	    {ok, PrimZip, FI, Ebins};
++	    {ok, PrimZip, Index, FI, Ebins};
+ 	Error ->
+ 	    Error
+     end;
++load_prim_archive(ArchiveFile, FileInfo, undefined) ->
++    load_prim_archive(ArchiveFile, undefined, FileInfo);
+ load_prim_archive(ArchiveFile, FileInfo, ParserFun) ->
+     case ParserFun(ArchiveFile) of
+ 	{ok, ArchiveBin} ->
+diff --git a/erts/preloaded/src/init.erl b/erts/preloaded/src/init.erl
+index d09a1ed23b..1fdc034dec 100644
+--- a/erts/preloaded/src/init.erl
++++ b/erts/preloaded/src/init.erl
+@@ -164,6 +164,9 @@ The `init` module interprets the following command-line flags:
+   The `-S` flag is only allowed on the command line. If passed through
+   `ERL_*FLAGS` or `-args_file` it will be parsed as a normal command line flag.
+ 
++- **`-primary_archive File`** - Sets the zip archive `File` as the primary
++  archive of `m:erl_prim_loader` before the boot script is read.
++
+ - **`-run Mod [Func [Arg1, Arg2, ...]]`** - Evaluates the specified function
+   call during system initialization. `Func` defaults to `start`. If no arguments
+   are provided, the function is assumed to be of arity 0. Otherwise it is
+@@ -1200,6 +1203,7 @@ do_boot(Init,Flags,Start) ->
+     Path = get_flag_list(path, Flags, false),
+     {Pa,Pz} = PathFls = path_flags(Flags),
+     start_prim_loader(Init, bs2ss(Path), PathFls),
++    set_primary_archive(Flags),
+     BootFile = bootfile(Flags,Root),
+     BootList = get_boot(BootFile,Root),
+     LoadMode = b2a(get_flag(mode, Flags, interactive)),
+@@ -1231,6 +1235,25 @@ get_root(Flags) ->
+ 	    exit(no_or_multiple_root_variables)
+     end.
+ 
++set_primary_archive(Flags) ->
++    case get_argument(primary_archive, Flags) of
++        {ok,[[File0]]} ->
++            File = b2s(File0),
++            {ok,FileInfo} = prim_file:read_file_info(File),
++            case erl_prim_loader:set_primary_archive(File, undefined,
++                                                     FileInfo, undefined) of
++                {ok,_Ebins} ->
++                    ok;
++                {error,Reason} ->
++                    erlang:display({"cannot open primary archive",File,Reason}),
++                    exit(Reason)
++            end;
++        {ok,_} ->
++            exit(multiple_primary_archive_variables);
++        error ->
++            ok
++    end.
++
+ check_bindir(Flags) ->
+     case get_argument(bindir, Flags) of
+ 	{ok,[[_Bindir]]} ->
+diff --git a/erts/preloaded/src/prim_zip.erl b/erts/preloaded/src/prim_zip.erl
+index 6f7691c60e..7985db49a4 100644
+--- a/erts/preloaded/src/prim_zip.erl
++++ b/erts/preloaded/src/prim_zip.erl
+@@ -30,7 +30,8 @@
+ 	 open/1,
+ 	 open/3,
+          foldl/3,
+-	 close/1
++	 close/1,
++	 read_z_file/2
+ 	]).
+ 
+ %% Internal function. Exported to avoid dialyzer warnings
+@@ -50,7 +51,8 @@
+ -record(primzip_file,
+ 	{name,
+ 	 get_info,
+-	 get_bin}).
++	 get_bin,
++	 location}). % {Offset, Size, CompMethod} of the local header and data
+ 
+ -record(primzip,
+ 	{files = [] :: [#primzip_file{}],
+@@ -116,8 +118,9 @@ foldl(_, _, _) ->
+     {error, einval}.
+ 
+ do_foldl(FilterFun, FilterAcc, [PF | Tail], Acc0, PrimZip, PrimZipOrig) ->
+-    #primzip_file{name = F, get_info = GetInfo, get_bin = GetBin} = PF,
+-    try FilterFun({F, GetInfo, GetBin}, FilterAcc) of
++    #primzip_file{name = F, get_info = GetInfo, get_bin = GetBin,
++		  location = Location} = PF,
++    try FilterFun({F, GetInfo, GetBin, Location}, FilterAcc) of
+ 	{Continue, Include, FilterAcc2} ->
+ 	    Acc1 = include_acc(Include, PF, Acc0),
+ 	    case Continue of
+@@ -176,8 +179,19 @@ get_zip_input(_) ->
+ %% get a file from the archive
+ get_z_file(F, Offset, ChunkSize, #primzip{zlib = Z, in = In0, input = Input}) ->
+     case Input({pread, Offset, ChunkSize}, In0) of
+-	{<<?LOCAL_FILE_MAGIC:32/little,
+-	  BLH:(?LOCAL_FILE_HEADER_SZ-4)/binary, _/binary>> = B, _In1} ->
++	{B, _In1} when is_binary(B) ->
++	    get_z_file_bin(F, B, Z);
++	_ ->
++	    throw({bad_local_file_header, F})
++    end.
++
++read_z_file(F, B) ->
++    get_z_file_bin(F, B, undefined).
++
++get_z_file_bin(F, B, Z) ->
++    case B of
++	<<?LOCAL_FILE_MAGIC:32/little,
++	  BLH:(?LOCAL_FILE_HEADER_SZ-4)/binary, _/binary>> ->
+ 	    #local_file_header{gp_flag = GPFlag,
+ 			       file_name_length = FNLen,
+ 			       extra_field_length = EFLen,
+@@ -202,6 +216,13 @@ get_z_file(F, Offset, ChunkSize, #primzip{zlib = Z, in = In0, input = Input}) ->
+ -define(MAX_WBITS, 15).
+ 
+ %% get compressed or stored data
++get_z_all(?DEFLATED, Compressed, undefined, F) ->
++    Z = zlib:open(),
++    try
++	get_z_all(?DEFLATED, Compressed, Z, F)
++    after
++	zlib:close(Z)
++    end;
+ get_z_all(?DEFLATED, Compressed, Z, _F) ->
+     ok = zlib:inflateInit(Z, -?MAX_WBITS),
+     Uncompressed = zlib:inflate(Z, Compressed),
+@@ -249,8 +270,10 @@ get_cd_loop(N, BCD, Acc0, PrimZip, FileName, Offset, CFH, EndOffset, FilterFun,
+     %% erlang:display({FileName, N, Offset, Size, NextPF}),
+     GetInfo = fun() -> cd_file_header_to_file_info(FileName, CFH, <<>>) end,
+     GetBin = fun() -> get_z_file(FileName, Offset, Size, PrimZip) end,
+-    PF = #primzip_file{name = FileName, get_info = GetInfo, get_bin = GetBin},
+-    try FilterFun({FileName, GetInfo, GetBin}, FilterAcc) of
++    Location = {Offset, Size, CFH#cd_file_header.comp_method},
++    PF = #primzip_file{name = FileName, get_info = GetInfo, get_bin = GetBin,
++		       location = Location},
++    try FilterFun({FileName, GetInfo, GetBin, Location}, FilterAcc) of
+ 	{Continue, Include, FilterAcc2} ->
+ 	    Acc1 =
+ 		case Include of
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,78 @@
+name: test
+on: [push, workflow_dispatch]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, target: linux-x86_64}
+          - {os: ubuntu-24.04-arm, target: linux-arm64}
+          - {os: macos-15, target: darwin-arm64}
+          - {os: macos-15-intel, target: darwin-x86_64}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get -qq update && sudo apt-get -qq install -y build-essential autoconf libncurses-dev libssl-dev unzip
+            echo "SSL_FLAGS=LIBS=/usr/lib/$(uname -m)-linux-gnu/libcrypto.a" >> $GITHUB_ENV
+          else
+            brew install -q autoconf openssl@3
+            echo "SSL_FLAGS=--with-ssl=$(brew --prefix openssl@3) LIBS=$(brew --prefix openssl@3)/lib/libcrypto.a --enable-jit" >> $GITHUB_ENV
+          fi
+      - name: OTP source at the base commit, with the patches
+        run: |
+          git clone -q --filter=blob:none https://github.com/erlang/otp otp
+          cd otp
+          git checkout -q e617ca6716
+          git config user.email ci@example.com && git config user.name ci
+          git am ../patches/*.patch
+          git log --oneline -4
+      - name: build
+        run: |
+          cd otp
+          ./configure --enable-static-nifs --disable-dynamic-ssl-lib --without-javac --without-wx --without-observer --without-debugger --without-et --without-megaco --without-diameter --without-snmp --without-jinterface --without-odbc $SSL_FLAGS > configure.log 2>&1 || { tail -50 configure.log; exit 1; }
+          ERL_TOP=$PWD make -C lib BUILD_STATIC_LIBS=1 TYPE=opt static_lib > static.log 2>&1 || { tail -30 static.log; exit 1; }
+          make -j$(getconf _NPROCESSORS_ONLN) > make.log 2>&1 || { grep -n -B5 'Error ' make.log | tail -60; exit 1; }
+          ls bin/erlaotc
+          if [ "$RUNNER_OS" = Linux ]; then strip bin/*/beam.smp; fi
+      - name: release test
+        run: bash release-test.sh
+      - name: elixir examples
+        run: |
+          export PATH=$PWD/otp/bin:$PATH
+          git clone -q --depth 1 https://github.com/elixir-lang/elixir elixir
+          (cd elixir && make -j$(getconf _NPROCESSORS_ONLN) > make.log 2>&1 || { tail -30 make.log; exit 1; })
+          export PATH=$PWD/elixir/bin:$PATH
+          mix local.hex --force > /dev/null
+          cd otp/examples
+          ./elixiraotc.exs build elixiraotc.exs
+          ./elixiraotc build hello.exs && ./hello
+          ./elixiraotc run hello.exs
+          for i in 1 2 3; do { time ./hello > /dev/null; } 2>&1; done
+          unzip -l hello | grep -c jitc/ || true
+          PATH=/usr/bin:/bin ./elixiraotc build elixiraotc.exs -o elixiraotc2 && PATH=/usr/bin:/bin ./elixiraotc2 run hello.exs
+          cp elixiraotc2 $GITHUB_WORKSPACE/elixiraotc-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elixiraotc-${{ matrix.target }}
+          path: elixiraotc-${{ matrix.target }}
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: |
+          chmod +x elixiraotc-*
+          ls -la elixiraotc-*
+          git config user.name ci && git config user.email ci@example.com
+          git add elixiraotc-*
+          git commit -m "elixiraotc builds from ${{ github.sha }}"
+          git push
