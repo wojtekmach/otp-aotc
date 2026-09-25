@@ -1,0 +1,8 @@
+/otp/
+/elixir/
+/work/
+/dist/
+/tmp/
+/elixiraotc-darwin-*
+/elixiraotc-linux-*
+/erl_crash.dump

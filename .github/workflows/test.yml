@@ -1,7 +1,54 @@
-name: test
-on: [push, workflow_dispatch]
+name: Build and release
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      otp_ref:
+        description: "OTP tag or commit (empty uses .github/build.json)"
+        type: string
+      publish_release:
+        description: "Create a draft release after all native builds pass"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 7 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elixiraotc-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      otp_sha: ${{ steps.resolve.outputs.otp_sha }}
+      elixir_sha: ${{ steps.resolve.outputs.elixir_sha }}
+      hex_version: ${{ steps.resolve.outputs.hex_version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: node --test .github/scripts/resolve.test.cjs
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        id: resolve
+        env:
+          REQUESTED_OTP_REF: ${{ inputs.otp_ref }}
+        with:
+          script: |
+            const resolve = require('./.github/scripts/resolve.cjs');
+            await resolve({github, context, core});
+
   test:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -11,68 +58,75 @@ jobs:
           - {os: macos-15, target: darwin-arm64}
           - {os: macos-15-intel, target: darwin-x86_64}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      OTP_SHA: ${{ needs.resolve.outputs.otp_sha }}
+      ELIXIR_SHA: ${{ needs.resolve.outputs.elixir_sha }}
+      HEX_VERSION: ${{ needs.resolve.outputs.hex_version }}
+      AOTC_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
-      - name: dependencies
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Dependencies
+        shell: bash
         run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get -qq update && sudo apt-get -qq install -y build-essential autoconf libncurses-dev libssl-dev unzip
-            echo "SSL_FLAGS=LIBS=/usr/lib/$(uname -m)-linux-gnu/libcrypto.a" >> $GITHUB_ENV
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential autoconf libncurses-dev libssl-dev unzip
           else
-            brew install -q autoconf openssl@3
-            echo "SSL_FLAGS=--with-ssl=$(brew --prefix openssl@3) LIBS=$(brew --prefix openssl@3)/lib/libcrypto.a --enable-jit" >> $GITHUB_ENV
+            brew install autoconf openssl@3
           fi
-      - name: OTP source at the base commit, with the patches
-        run: |
-          git clone -q --filter=blob:none https://github.com/erlang/otp otp
-          cd otp
-          git checkout -q e617ca6716
-          git config user.email ci@example.com && git config user.name ci
-          git am ../patches/*.patch
-          git log --oneline -4
-      - name: build
-        run: |
-          cd otp
-          ./configure --enable-static-nifs --disable-dynamic-ssl-lib --without-javac --without-wx --without-observer --without-debugger --without-et --without-megaco --without-diameter --without-snmp --without-jinterface --without-odbc $SSL_FLAGS > configure.log 2>&1 || { tail -50 configure.log; exit 1; }
-          ERL_TOP=$PWD make -C lib BUILD_STATIC_LIBS=1 TYPE=opt static_lib > static.log 2>&1 || { tail -30 static.log; exit 1; }
-          make -j$(getconf _NPROCESSORS_ONLN) > make.log 2>&1 || { grep -n -B5 'Error ' make.log | tail -60; exit 1; }
-          ls bin/erlaotc
-          if [ "$RUNNER_OS" = Linux ]; then strip bin/*/beam.smp; fi
-      - name: release test
-        run: bash release-test.sh
-      - name: elixir examples
-        run: |
-          export PATH=$PWD/otp/bin:$PATH
-          git clone -q --depth 1 https://github.com/elixir-lang/elixir elixir
-          (cd elixir && make -j$(getconf _NPROCESSORS_ONLN) > make.log 2>&1 || { tail -30 make.log; exit 1; })
-          export PATH=$PWD/elixir/bin:$PATH
-          mix local.hex --force > /dev/null
-          cd otp/examples
-          ./elixiraotc.exs build elixiraotc.exs
-          ./elixiraotc build hello.exs && ./hello
-          ./elixiraotc run hello.exs
-          for i in 1 2 3; do { time ./hello > /dev/null; } 2>&1; done
-          unzip -l hello | grep -c jitc/ || true
-          PATH=/usr/bin:/bin ./elixiraotc build elixiraotc.exs -o elixiraotc2 && PATH=/usr/bin:/bin ./elixiraotc2 run hello.exs
-          cp elixiraotc2 $GITHUB_WORKSPACE/elixiraotc-${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - name: Build patched OTP and run release and self-hosting checks
+        run: bash .github/scripts/build.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: elixiraotc-${{ matrix.target }}
-          path: elixiraotc-${{ matrix.target }}
+          path: dist/elixiraotc-${{ matrix.target }}
+          if-no-files-found: error
+
   publish:
-    needs: test
+    needs: [resolve, test]
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release) ||
+      (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@0f75c29430f34bb5af4cce5e3b7f6a8860fca236 # v1
+        with:
+          otp-version: "29.0.3"
+          elixir-version: "1.20.2"
+      - run: elixir .github/scripts/manifest_test.exs
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: elixiraotc-*
           merge-multiple: true
-      - run: |
-          chmod +x elixiraotc-*
-          ls -la elixiraotc-*
-          git config user.name ci && git config user.email ci@example.com
-          git add elixiraotc-*
-          git commit -m "elixiraotc builds from ${{ github.sha }}"
-          git push
+          path: dist
+      - name: Generate manifest and checksums
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          OTP_SHA: ${{ needs.resolve.outputs.otp_sha }}
+          ELIXIR_SHA: ${{ needs.resolve.outputs.elixir_sha }}
+          HEX_VERSION: ${{ needs.resolve.outputs.hex_version }}
+        run: elixir .github/scripts/manifest.exs dist
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: dist/*
+      - name: Create draft release without changing a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$REPOSITORY" --target "$SOURCE_SHA" --draft \
+            --title "$RELEASE_TAG" --notes-file .github/release-notes.md
