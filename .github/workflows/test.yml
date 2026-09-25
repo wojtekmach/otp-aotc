@@ -63,7 +63,7 @@ jobs:
       OTP_SHA: ${{ needs.resolve.outputs.otp_sha }}
       ELIXIR_SHA: ${{ needs.resolve.outputs.elixir_sha }}
       HEX_VERSION: ${{ needs.resolve.outputs.hex_version }}
-      TARGET: ${{ matrix.target }}
+      AOTC_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

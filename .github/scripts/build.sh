@@ -5,9 +5,10 @@ cd "$ROOT"
 : "${OTP_SHA:?}"
 : "${ELIXIR_SHA:?}"
 : "${HEX_VERSION:?}"
-: "${TARGET:?}"
+: "${AOTC_TARGET:?}"
 [[ "$OTP_SHA" =~ ^[0-9a-f]{40}$ && "$ELIXIR_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-case "$TARGET" in darwin-arm64|darwin-x86_64|linux-arm64|linux-x86_64) ;; *) exit 1 ;; esac
+# TARGET belongs to OTP's makefiles; keep the release-asset label separate.
+case "$AOTC_TARGET" in darwin-arm64|darwin-x86_64|linux-arm64|linux-x86_64) ;; *) exit 1 ;; esac
 
 git clone --filter=blob:none --no-checkout https://github.com/erlang/otp.git otp
 git -C otp checkout --detach "$OTP_SHA"
@@ -50,4 +51,4 @@ unzip -l hello | grep 'jitc/atoms'
 PATH=/usr/bin:/bin ./elixiraotc build elixiraotc.exs -o elixiraotc2
 PATH=/usr/bin:/bin ./elixiraotc2 run hello.exs
 mkdir -p "$ROOT/dist"
-cp elixiraotc2 "$ROOT/dist/elixiraotc-$TARGET"
+cp elixiraotc2 "$ROOT/dist/elixiraotc-$AOTC_TARGET"
