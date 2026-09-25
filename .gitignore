@@ -3,6 +3,7 @@
 /work/
 /dist/
 /tmp/
+/native-sdk/
 /elixiraotc-darwin-*
 /elixiraotc-linux-*
 /erl_crash.dump
