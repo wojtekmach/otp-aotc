@@ -52,3 +52,11 @@ PATH=/usr/bin:/bin ./elixiraotc build elixiraotc.exs -o elixiraotc2
 PATH=/usr/bin:/bin ./elixiraotc2 run hello.exs
 mkdir -p "$ROOT/dist"
 cp elixiraotc2 "$ROOT/dist/elixiraotc-$AOTC_TARGET"
+
+# Relinkable emulator for statically linking application NIFs (see README).
+cd "$ROOT"
+SDK="$ROOT/work/native-sdk"
+rm -rf "$SDK"
+elixir scripts/export-native-sdk.exs otp "$SDK"
+OTP="$ROOT/otp" NATIVE_SDK="$SDK" elixir scripts/test-native-sdk.exs
+tar -czf "$ROOT/dist/elixiraotc-native-sdk-$AOTC_TARGET.tar.gz" -C "$SDK" .

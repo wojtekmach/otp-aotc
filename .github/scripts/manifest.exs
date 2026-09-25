@@ -19,18 +19,19 @@ defmodule ReleaseManifest do
     unless tag == "otp-#{String.slice(otp, 0, 12)}-aot-#{String.slice(source, 0, 12)}",
       do: raise("Release tag does not match source commits")
 
-    artifacts =
-      Map.new(@targets, fn target ->
-        name = "elixiraotc-#{target}"
-        path = Path.join(directory, name)
-        # File.read/stat failures stop publication if any matrix artifact is absent.
-        {target,
-         %{
-           "url" => "https://github.com/#{repository}/releases/download/#{tag}/#{name}",
-           "sha256" => digest(path),
-           "bytes" => File.stat!(path).size
-         }}
-      end)
+    # File.read/stat failures stop publication if any matrix artifact is absent.
+    asset = fn name ->
+      path = Path.join(directory, name)
+
+      %{
+        "url" => "https://github.com/#{repository}/releases/download/#{tag}/#{name}",
+        "sha256" => digest(path),
+        "bytes" => File.stat!(path).size
+      }
+    end
+
+    artifacts = Map.new(@targets, &{&1, asset.(executable(&1))})
+    native_sdks = Map.new(@targets, &{&1, asset.(native_sdk(&1))})
 
     manifest = %{
       "schema" => 1,
@@ -39,16 +40,24 @@ defmodule ReleaseManifest do
       "otp_commit" => otp,
       "elixir_commit" => elixir,
       "hex_version" => hex,
-      "artifacts" => artifacts
+      "artifacts" => artifacts,
+      "native_sdks" => native_sdks
     }
 
     manifest_path = Path.join(directory, "toolchain.json")
     File.write!(manifest_path, JSON.encode!(manifest) <> "\n")
-    names = Enum.map(@targets, &"elixiraotc-#{&1}") ++ ["toolchain.json"]
+
+    names =
+      Enum.map(@targets, &executable/1) ++
+        Enum.map(@targets, &native_sdk/1) ++ ["toolchain.json"]
+
     sums = Enum.map_join(names, "", &"#{digest(Path.join(directory, &1))}  #{&1}\n")
     File.write!(Path.join(directory, "SHA256SUMS"), sums)
     manifest
   end
+
+  defp executable(target), do: "elixiraotc-#{target}"
+  defp native_sdk(target), do: "elixiraotc-native-sdk-#{target}.tar.gz"
 
   defp digest(path) do
     path

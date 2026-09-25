@@ -8,6 +8,7 @@ defmodule ReleaseManifestTest do
   setup %{tmp_dir: dir} do
     for target <- ~w(darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64) do
       File.write!(Path.join(dir, "elixiraotc-#{target}"), "executable for #{target}")
+      File.write!(Path.join(dir, "elixiraotc-native-sdk-#{target}.tar.gz"), "sdk for #{target}")
     end
 
     {:ok,
@@ -33,14 +34,29 @@ defmodule ReleaseManifestTest do
       assert artifact["url"] =~ "/releases/download/#{env["RELEASE_TAG"]}/elixiraotc-#{target}"
     end
 
+    assert map_size(manifest["native_sdks"]) == 4
+
+    for {target, sdk} <- manifest["native_sdks"] do
+      name = "elixiraotc-native-sdk-#{target}.tar.gz"
+      bytes = File.read!(Path.join(dir, name))
+      assert sdk["sha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+      assert sdk["url"] =~ "/releases/download/#{env["RELEASE_TAG"]}/#{name}"
+    end
+
     sums = File.read!(Path.join(dir, "SHA256SUMS"))
-    assert length(String.split(sums, "\n", trim: true)) == 5
+    assert length(String.split(sums, "\n", trim: true)) == 9
     assert sums =~ "  toolchain.json\n"
     assert ReleaseManifest.write!(dir, env) == manifest
   end
 
   test "a missing matrix artifact prevents publication", %{tmp_dir: dir, env: env} do
     File.rm!(Path.join(dir, "elixiraotc-linux-arm64"))
+    assert_raise File.Error, fn -> ReleaseManifest.write!(dir, env) end
+    refute File.exists?(Path.join(dir, "toolchain.json"))
+  end
+
+  test "a missing native SDK prevents publication", %{tmp_dir: dir, env: env} do
+    File.rm!(Path.join(dir, "elixiraotc-native-sdk-darwin-x86_64.tar.gz"))
     assert_raise File.Error, fn -> ReleaseManifest.write!(dir, env) end
     refute File.exists?(Path.join(dir, "toolchain.json"))
   end
